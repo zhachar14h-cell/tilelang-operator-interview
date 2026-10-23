@@ -1,0 +1,9 @@
+{
+  "lessons": 18,
+  "modules": 9,
+  "scripts": 21,
+  "python_syntax": "passed",
+  "gpu_compilation": "not_run",
+  "gpu_correctness": "not_run",
+  "gpu_performance": "not_run"
+}

@@ -1,0 +1,686 @@
+[
+  {
+    "id": "P07",
+    "module": "M3",
+    "title": "Stable Row Softmax",
+    "subtitle": "先减最大值，再做两次行归约",
+    "difficulty": "进阶",
+    "minutes": 35,
+    "tags": [
+      "行归约",
+      "数值稳定",
+      "尾部掩码"
+    ],
+    "statement": "给定连续的 FP32 矩阵 X[M,N]，对每行独立计算 Softmax。一个 block 持有一整行，完成最大值归约、指数、求和和归一化。代码覆盖非 2 次幂 N；重点是归约轴、padding 中性值和浮点数边界。",
+    "formula": "m_i=max_j x_ij；p_ij=exp(x_ij−m_i)/Σ_k exp(x_ik−m_i)",
+    "inputs": "X: [M,N]，连续 float32 CUDA 张量；M>0，1≤N≤4096。",
+    "outputs": "Y: [M,N], float32；每行非负且和约等于 1。",
+    "constraints": [
+      "仅支持有限输入；NaN、+Inf、整行 −Inf 不在本题契约内。",
+      "BLOCK 为不小于 N 的 2 次幂；一个 block 处理一行。",
+      "长行需要分段归约或 online softmax，不能无限增加寄存器 tile。",
+      "已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。"
+    ],
+    "approach": [
+      "将列长度补到 2 次幂，padding 设为 −Inf，不影响 max 且指数后为 0。",
+      "归约行最大值，再对每个元素计算 exp(x−max)。",
+      "归约分母，只写回真实列；中间指数值留在 fragment。"
+    ],
+    "mapping": [
+      {
+        "cuda": "warp/block reduce max",
+        "tilelang": "T.reduce_max(..., dim=1)",
+        "why": "表达列归约，由编译器生成线程通信。"
+      },
+      {
+        "cuda": "指数后的 block reduce sum",
+        "tilelang": "T.Parallel + T.reduce_sum",
+        "why": "数据留在 fragment，避免临时矩阵落到全局内存。"
+      },
+      {
+        "cuda": "越界 lane 加载 −Inf",
+        "tilelang": "T.if_then_else(j < N, ..., −T.infinity(...))",
+        "why": "保持归约语义且不读取无效列。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 单行寄存器融合",
+        "note": "完整脚本，含 N=1、尾部和大有限偏置；128 线程只是起点。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_softmax(M, N):\n    assert M > 0 and 1 <= N <= 4096\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(X: T.Tensor((M, N), \"float32\"),\n             Y: T.Tensor((M, N), \"float32\")):\n        with T.Kernel(M, threads=128) as row:\n            values = T.alloc_fragment((1, BLOCK), \"float32\")\n            maximum = T.alloc_fragment((1,), \"float32\")\n            denominator = T.alloc_fragment((1,), \"float32\")\n            for j in T.Parallel(BLOCK):\n                values[0, j] = T.if_then_else(\n                    j < N, X[row, j], -T.infinity(\"float32\"))\n            T.reduce_max(values, maximum, dim=1)\n            for j in T.Parallel(BLOCK):\n                values[0, j] = T.exp(values[0, j] - maximum[0])\n            T.reduce_sum(values, denominator, dim=1)\n            for j in T.Parallel(BLOCK):\n                if j < N:\n                    Y[row, j] = values[0, j] / denominator[0]\n    return main\n\n\ndef check(M, N):\n    assert torch.cuda.is_available()\n    x = (torch.randn((M, N), device=\"cuda\") * 10).contiguous()\n    x[0].fill_(1000.0)\n    if M > 1:\n        x[1].add_(1000.0)\n    y = torch.empty_like(x)\n    make_softmax(M, N)(x, y)\n    torch.testing.assert_close(y, torch.softmax(x, -1),\n                               rtol=1e-4, atol=1e-6)\n    torch.testing.assert_close(y.sum(-1), torch.ones(M, device=\"cuda\"),\n                               rtol=1e-5, atol=1e-5)\n    print(f\"passed: M={M}, N={N}\")\n\n\nif __name__ == \"__main__\":\n    torch.manual_seed(0)\n    for n in (1, 127, 1024, 4095):\n        check(32, n)\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "padding 不应填 0",
+        "body": "真实元素全为负时，0 会抬高 max，且越界元素指数后会错误进入分母。应填 −Inf。"
+      },
+      {
+        "title": "特殊值需定义契约",
+        "body": "减最大值避免有限输入的大正指数；整行 −Inf 仍会出现 −Inf−(−Inf)。带 mask 的生产实现需定义全掩码行行为。"
+      },
+      {
+        "title": "长行寄存器压力",
+        "body": "N 很大可能溢出到 local memory。应检查编译资源与实际流量，再决定分段。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么减最大值不改变结果？",
+        "a": "分子分母同时乘 exp(−m)，比值不变；至少一个有效元素变成 exp(0)=1。"
+      },
+      {
+        "q": "为什么不用原子加？",
+        "a": "一个 block 拥有完整行，归约在块内完成，没有跨 block 合并。"
+      },
+      {
+        "q": "N 增到 65536 怎样改？",
+        "a": "考虑分块求局部 max/sum 后合并，或 online softmax，重新权衡寄存器与额外读写。"
+      }
+    ],
+    "checklist": [
+      "验证 N=1、127、4095。",
+      "与 torch.softmax 对比并检查行和。",
+      "构造常数行与大有限偏置。"
+    ],
+    "blanks": [
+      {
+        "prompt": "Softmax padding 的加载值应为 ______。",
+        "answer": "-T.infinity(\"float32\")",
+        "hint": "不影响 max，且指数后贡献 0。"
+      },
+      {
+        "prompt": "values 形状为 [1,BLOCK]，沿列归约的 dim 是 ______。",
+        "answer": "1",
+        "hint": "dim=0 会归约长度为 1 的行轴。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方核心指令",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方归约源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      }
+    ]
+  },
+  {
+    "id": "P08",
+    "module": "M3",
+    "title": "LayerNorm",
+    "subtitle": "用中心方差避开 E[x²]−E[x]² 的消减",
+    "difficulty": "进阶",
+    "minutes": 45,
+    "tags": [
+      "归一化",
+      "两遍归约",
+      "FP32"
+    ],
+    "statement": "给定 X[M,N]、gamma[N]、beta[N]，实现最后一维 LayerNorm。先计算均值，再归约中心平方差；统计量使用 FP32，融合 affine。“两遍”指寄存器中的两次统计遍历，不要求从显存重复读取 X。",
+    "formula": "μ_i=Σ_jx_ij/N；σ²_i=Σ_j(x_ij−μ_i)²/N；y_ij=(x_ij−μ_i)·rsqrt(σ²_i+ε)·γ_j+β_j",
+    "inputs": "X: [M,N]；gamma、beta: [N]；连续 float32 CUDA 张量；epsilon>0。",
+    "outputs": "Y: [M,N], float32；使用总体方差，分母是 N。",
+    "constraints": [
+      "M>0，1≤N≤4096；输入与权重有限、幅度适中，FP32 均值归约和中心平方差归约都不得溢出。",
+      "仅前向、最后一维归一化；不支持 backward、任意 strides、多轴归一化。",
+      "中心平方差改善稳定性，FP32 求和仍有舍入误差。",
+      "已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。"
+    ],
+    "approach": [
+      "加载完整行，padding 填 0；归约 sum 除以真实 N。",
+      "保留原始值，按均值计算中心平方差；padding 平方差显式设为 0。",
+      "归约平方差，求 rsqrt(var+eps)，融合 gamma/beta 输出。"
+    ],
+    "mapping": [
+      {
+        "cuda": "两次 warp/block sum",
+        "tilelang": "两次 T.reduce_sum(..., dim=1)",
+        "why": "直接表达均值和中心方差。"
+      },
+      {
+        "cuda": "寄存器复用输入",
+        "tilelang": "T.alloc_fragment((1,BLOCK), \"float32\")",
+        "why": "统计与 affine 共用已加载数据。"
+      },
+      {
+        "cuda": "sqrt 再求倒数",
+        "tilelang": "T.rsqrt(variance/N+EPS)",
+        "why": "epsilon 在平方根内部。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 均值 + 中心方差",
+        "note": "完整 FP32 脚本，覆盖常数行和带偏置输入；没有把两遍法称为 Welford。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\nimport torch\nimport torch.nn.functional as F\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_layernorm(M, N, EPS=1e-5):\n    assert M > 0 and 1 <= N <= 4096 and EPS > 0\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(X: T.Tensor((M, N), \"float32\"),\n             G: T.Tensor((N,), \"float32\"),\n             B: T.Tensor((N,), \"float32\"),\n             Y: T.Tensor((M, N), \"float32\")):\n        with T.Kernel(M, threads=128) as row:\n            values = T.alloc_fragment((1, BLOCK), \"float32\")\n            centered_sq = T.alloc_fragment((1, BLOCK), \"float32\")\n            total = T.alloc_fragment((1,), \"float32\")\n            mean = T.alloc_fragment((1,), \"float32\")\n            variance = T.alloc_fragment((1,), \"float32\")\n            invstd = T.alloc_fragment((1,), \"float32\")\n            for j in T.Parallel(BLOCK):\n                values[0, j] = T.if_then_else(j < N, X[row, j], 0.0)\n            T.reduce_sum(values, total, dim=1)\n            for r in T.Parallel(1):\n                mean[r] = total[r] / N\n            # Second statistical pass: centered squared differences.\n            for j in T.Parallel(BLOCK):\n                centered_sq[0, j] = T.if_then_else(\n                    j < N, (values[0, j] - mean[0]) * (values[0, j] - mean[0]), 0.0)\n            T.reduce_sum(centered_sq, variance, dim=1)\n            for r in T.Parallel(1):\n                invstd[r] = T.rsqrt(variance[r] / N + EPS)\n            for j in T.Parallel(BLOCK):\n                if j < N:\n                    Y[row, j] = ((values[0, j] - mean[0])\n                                 * invstd[0] * G[j] + B[j])\n    return main\n\n\ndef check(N, offset):\n    M, eps = 32, 1e-5\n    x = (torch.randn((M, N), device=\"cuda\") + offset).contiguous()\n    x[0].fill_(offset)\n    gamma = torch.randn(N, device=\"cuda\")\n    beta = torch.randn(N, device=\"cuda\")\n    y = torch.empty_like(x)\n    make_layernorm(M, N, eps)(x, gamma, beta, y)\n    ref = F.layer_norm(x, (N,), gamma, beta, eps)\n    torch.testing.assert_close(y, ref, rtol=3e-4, atol=3e-4)\n    print(f\"passed: N={N}, offset={offset}\")\n\n\nif __name__ == \"__main__\":\n    assert torch.cuda.is_available()\n    torch.manual_seed(0)\n    for n in (1, 255, 1024, 4095):\n        check(n, 0.0)\n        check(n, 100.0)\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "padding 的平方差也要清零",
+        "body": "原始 padding=0，减均值后一般不为 0，不能让这些虚构位置参与方差。"
+      },
+      {
+        "title": "分母使用真实 N",
+        "body": "不能使用 BLOCK 或 N−1；LayerNorm 的参考语义是总体方差。"
+      },
+      {
+        "title": "大均值、小方差",
+        "body": "E[x²]−E[x]² 可能严重消减甚至变负。中心平方差能改善，极端场景还应考虑 Welford 与更高精度参考。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "这是 Welford 吗？",
+        "a": "不是。它先求均值再算中心平方差；Welford 维护可合并的 count、mean、M2。"
+      },
+      {
+        "q": "为什么不是除以 N−1？",
+        "a": "LayerNorm 使用这一组特征的总体方差，与 torch.layer_norm 对齐应除以 N。"
+      },
+      {
+        "q": "gamma=1、beta=0 后方差一定是 1？",
+        "a": "epsilon 使结果方差约为 var/(var+eps)；常数行输出为 0。"
+      }
+    ],
+    "checklist": [
+      "测试 N=1、常数行、非 2 次幂 N。",
+      "对齐 F.layer_norm 的 epsilon 和 affine 顺序。",
+      "用大均值小波动输入检查误差与 NaN。"
+    ],
+    "blanks": [
+      {
+        "prompt": "padding 位置的中心平方差应为 ______。",
+        "answer": "0.0",
+        "hint": "虚构特征不能贡献方差。"
+      },
+      {
+        "prompt": "LayerNorm 方差的归一化分母是 ______。",
+        "answer": "N",
+        "hint": "使用总体方差。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方核心指令",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方归约源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "PyTorch 官方 LayerNorm 定义",
+        "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html"
+      }
+    ]
+  },
+  {
+    "id": "P09",
+    "module": "M3",
+    "title": "RMSNorm + Residual",
+    "subtitle": "一次平方和归约，融合残差相加",
+    "difficulty": "进阶",
+    "minutes": 35,
+    "tags": [
+      "RMSNorm",
+      "融合",
+      "Residual"
+    ],
+    "statement": "实现按行 RMSNorm。基础版直接归一化 X；扩展版先形成 U=X+Residual，再归一化 U。统计与权重乘法在一个 kernel 完成。扩展版只返回 Y，不额外输出 U，也不修改输入残差。",
+    "formula": "u=x 或 x+r；rms_inv=rsqrt(Σ_j u_j²/N+ε)；y_j=u_j·rms_inv·w_j",
+    "inputs": "X: [M,N]，W: [N]；扩展版另输入 Residual: [M,N]；连续 float32 CUDA 张量。",
+    "outputs": "Y: [M,N], float32；不减均值，没有 beta。",
+    "constraints": [
+      "M>0，1≤N≤4096，epsilon>0；输入/权重有限，U=X 或 X+R 必须有限，且 U 的 FP32 平方和不得溢出。",
+      "仅 FP32 前向；不含 FP16/BF16 转换、backward 或 residual 输出。",
+      "需要 residual 时选 v1；无 residual 时选 v0，避免多余读取。",
+      "已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。"
+    ],
+    "approach": [
+      "一行一个 block，padding 填 0，计算各列平方。",
+      "归约平方和，除以真实 N 后加 epsilon，再取 rsqrt。",
+      "输出 values×inv_rms×weight；v1 将 values 替换为 X+Residual 并在寄存器复用。"
+    ],
+    "mapping": [
+      {
+        "cuda": "平方和 block reduction",
+        "tilelang": "T.reduce_sum(squares, square_sum, dim=1)",
+        "why": "只需一类统计量。"
+      },
+      {
+        "cuda": "先 add kernel，再 norm kernel",
+        "tilelang": "T.Parallel 直接读取 X+R",
+        "why": "无需完整中间 U 的写回与重读。"
+      },
+      {
+        "cuda": "weight[col] 广播",
+        "tilelang": "输出乘 W[j]",
+        "why": "权重按列、沿行广播。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 纯 RMSNorm",
+        "note": "完整脚本，含全零行。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_rmsnorm(M, N, EPS=1e-6):\n    assert M > 0 and 1 <= N <= 4096 and EPS > 0\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(X: T.Tensor((M, N), \"float32\"),\n             W: T.Tensor((N,), \"float32\"),\n             Y: T.Tensor((M, N), \"float32\")):\n        with T.Kernel(M, threads=128) as row:\n            values = T.alloc_fragment((1, BLOCK), \"float32\")\n            squares = T.alloc_fragment((1, BLOCK), \"float32\")\n            square_sum = T.alloc_fragment((1,), \"float32\")\n            inv_rms = T.alloc_fragment((1,), \"float32\")\n            for j in T.Parallel(BLOCK):\n                values[0, j] = T.if_then_else(j < N, X[row, j], 0.0)\n                squares[0, j] = values[0, j] * values[0, j]\n            T.reduce_sum(squares, square_sum, dim=1)\n            for r in T.Parallel(1):\n                inv_rms[r] = T.rsqrt(square_sum[r] / N + EPS)\n            for j in T.Parallel(BLOCK):\n                if j < N:\n                    Y[row, j] = values[0, j] * inv_rms[0] * W[j]\n    return main\n\n\ndef reference(x, weight, eps):\n    scale = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)\n    return x * scale * weight\n\n\ndef check(N):\n    M, eps = 32, 1e-6\n    x = torch.randn((M, N), device=\"cuda\")\n    x[0].zero_()\n    weight = torch.randn(N, device=\"cuda\")\n    y = torch.empty_like(x)\n    make_rmsnorm(M, N, eps)(x, weight, y)\n    torch.testing.assert_close(y, reference(x, weight, eps),\n                               rtol=1e-4, atol=1e-5)\n    print(f\"passed: N={N}\")\n\n\nif __name__ == \"__main__\":\n    assert torch.cuda.is_available()\n    torch.manual_seed(0)\n    for n in (1, 255, 1024, 4095):\n        check(n)\n"
+      },
+      {
+        "name": "v1 · 融合 Residual Add",
+        "note": "完整脚本；语义是 RMSNorm(X+R)，只写 Y；未声称实测提速。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_residual_rmsnorm(M, N, EPS=1e-6):\n    assert M > 0 and 1 <= N <= 4096 and EPS > 0\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(X: T.Tensor((M, N), \"float32\"),\n             R: T.Tensor((M, N), \"float32\"),\n             W: T.Tensor((N,), \"float32\"),\n             Y: T.Tensor((M, N), \"float32\")):\n        with T.Kernel(M, threads=128) as row:\n            combined = T.alloc_fragment((1, BLOCK), \"float32\")\n            squares = T.alloc_fragment((1, BLOCK), \"float32\")\n            square_sum = T.alloc_fragment((1,), \"float32\")\n            inv_rms = T.alloc_fragment((1,), \"float32\")\n            for j in T.Parallel(BLOCK):\n                combined[0, j] = T.if_then_else(\n                    j < N, X[row, j] + R[row, j], 0.0)\n                squares[0, j] = combined[0, j] * combined[0, j]\n            T.reduce_sum(squares, square_sum, dim=1)\n            for r in T.Parallel(1):\n                inv_rms[r] = T.rsqrt(square_sum[r] / N + EPS)\n            for j in T.Parallel(BLOCK):\n                if j < N:\n                    Y[row, j] = combined[0, j] * inv_rms[0] * W[j]\n    return main\n\n\ndef check(M=32, N=1023):\n    eps = 1e-6\n    x = torch.randn((M, N), device=\"cuda\")\n    residual = torch.randn_like(x)\n    weight = torch.randn(N, device=\"cuda\")\n    y = torch.empty_like(x)\n    make_residual_rmsnorm(M, N, eps)(x, residual, weight, y)\n    u = x + residual\n    ref = u * torch.rsqrt(u.square().mean(-1, keepdim=True) + eps)\n    ref = ref * weight\n    torch.testing.assert_close(y, ref, rtol=1e-4, atol=1e-5)\n    print(\"residual RMSNorm passed\")\n\n\nif __name__ == \"__main__\":\n    assert torch.cuda.is_available()\n    torch.manual_seed(0)\n    check()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "残差放在哪",
+        "body": "RMSNorm(X+R) 与 RMSNorm(X)+R 不同；先确认计算图与是否需要保存更新后的残差。"
+      },
+      {
+        "title": "epsilon 位置",
+        "body": "epsilon 加在均方值上，再取 rsqrt；不能放到 rsqrt 外部。"
+      },
+      {
+        "title": "无需减均值",
+        "body": "RMSNorm 不中心化；照搬 LayerNorm 的均值项会改变数学含义与开销。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "融合减少了什么流量？",
+        "a": "省去中间 U 的写出与重读，但仍需读取 X 和 R；若下游需要 U，还要增加输出写入。"
+      },
+      {
+        "q": "全零行怎样处理？",
+        "a": "epsilon>0 保证倒 RMS 有限，最终输出为 0。"
+      },
+      {
+        "q": "如何支持 FP16 输入、FP32 统计？",
+        "a": "加载后提升为 FP32，平方和与归一化保持 FP32，最后按输出契约转换，并重新验证误差。"
+      }
+    ],
+    "checklist": [
+      "测试全零行、N=1、非整齐列数。",
+      "分别对齐 RMSNorm(X) 与 RMSNorm(X+R)。",
+      "确认 Residual 不被修改并明确是否需要输出 U。"
+    ],
+    "blanks": [
+      {
+        "prompt": "倒尺度是 rsqrt(______ + EPS)。",
+        "answer": "square_sum[0] / N",
+        "hint": "先求均方值。"
+      },
+      {
+        "prompt": "融合版归一化前的 combined 为 ______。",
+        "answer": "X[row, j] + R[row, j]",
+        "hint": "残差在归一化之前相加。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方核心指令",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方归约源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方 RMSNorm 示例（学习来源）",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/examples/norm/rms_norm.py"
+      }
+    ]
+  },
+  {
+    "id": "P10",
+    "module": "M4",
+    "title": "RoPE 双布局",
+    "subtitle": "相邻配对与前后半区配对必须分清",
+    "difficulty": "进阶",
+    "minutes": 35,
+    "tags": [
+      "RoPE",
+      "布局",
+      "成对旋转"
+    ],
+    "statement": "对 X[S,D] 的每个 token 执行二维旋转。输入预计算 Cos/Sin 表，分别支持 interleaved 配对 (2j,2j+1) 和 half-split 配对 (j,j+D/2)。同一输入在两种布局下代表不同配对；布局必须与模型的 Q/K 特征约定一致。",
+    "formula": "a′=a·cosθ−b·sinθ；b′=a·sinθ+b·cosθ；θ(pos,j)=pos·10000^(−2j/D)",
+    "inputs": "X: [S,D]；Cos、Sin: [S,D/2]；连续 float32 CUDA 张量。",
+    "outputs": "Y: [S,D], float32；全部 D 维参与旋转。",
+    "constraints": [
+      "S>0、D>0 且 D 偶数；只支持 out-of-place 输出。",
+      "仅演示单个 Q 或 K 矩阵；batch/head 布局须由调用方明确。",
+      "不含 partial rotary、NTK/YaRN、KV cache 管理或 fused Q/K。",
+      "Cos/Sin 已按实际 position 构造；host 示例从位置 0 开始。",
+      "已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。"
+    ],
+    "approach": [
+      "将 S×(D/2) 个配对线性展开，每个逻辑迭代处理一对。",
+      "factory 阶段确定 STEP、OFFSET，用同一旋转表达式覆盖两种布局。",
+      "读取两个原始值和 cos/sin，写回两个输出；边界检查作用于 pair。"
+    ],
+    "mapping": [
+      {
+        "cuda": "一个线程负责一对通道",
+        "tilelang": "T.Parallel(BLOCK) 处理 pair",
+        "why": "分开表达逻辑 pair 与物理线程映射。"
+      },
+      {
+        "cuda": "索引 2j、2j+1",
+        "tilelang": "STEP=2、OFFSET=1",
+        "why": "相邻通道配对。"
+      },
+      {
+        "cuda": "索引 j、j+D/2",
+        "tilelang": "STEP=1、OFFSET=D/2",
+        "why": "前后半区配对，不能只换 sin 符号。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 一份 factory，两种布局",
+        "note": "完整脚本；分别对齐参考并检查范数。Cos/Sin 在 host 生成，其三角函数成本不属于本 kernel。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_rope(S, D, interleaved=True, BLOCK=256):\n    assert S > 0 and D > 0 and D % 2 == 0\n    HALF = D // 2\n    STEP = 2 if interleaved else 1\n    OFFSET = 1 if interleaved else HALF\n\n    @T.prim_func\n    def main(X: T.Tensor((S, D), \"float32\"),\n             Cos: T.Tensor((S, HALF), \"float32\"),\n             Sin: T.Tensor((S, HALF), \"float32\"),\n             Y: T.Tensor((S, D), \"float32\")):\n        with T.Kernel(T.ceildiv(S * HALF, BLOCK), threads=128) as bx:\n            for lane in T.Parallel(BLOCK):\n                pair = bx * BLOCK + lane\n                if pair < S * HALF:\n                    row = pair // HALF\n                    j = pair % HALF\n                    ia = j * STEP\n                    ib = ia + OFFSET\n                    a = X[row, ia]\n                    b = X[row, ib]\n                    c = Cos[row, j]\n                    s = Sin[row, j]\n                    Y[row, ia] = a * c - b * s\n                    Y[row, ib] = a * s + b * c\n    return main\n\n\ndef reference(x, cos, sin, interleaved):\n    if interleaved:\n        a, b = x[:, 0::2], x[:, 1::2]\n        return torch.stack((a * cos - b * sin,\n                            a * sin + b * cos), dim=-1).flatten(-2)\n    a, b = x.chunk(2, dim=-1)\n    return torch.cat((a * cos - b * sin, a * sin + b * cos), -1)\n\n\ndef check(S=17, D=64):\n    x = torch.randn((S, D), device=\"cuda\", dtype=torch.float32)\n    position = torch.arange(S, device=\"cuda\", dtype=torch.float32)\n    j = torch.arange(D // 2, device=\"cuda\", dtype=torch.float32)\n    inverse_frequency = torch.pow(10000.0, -2.0 * j / D)\n    angle = position[:, None] * inverse_frequency[None, :]\n    cos, sin = angle.cos().contiguous(), angle.sin().contiguous()\n    for interleaved in (True, False):\n        y = torch.empty_like(x)\n        make_rope(S, D, interleaved)(x, cos, sin, y)\n        ref = reference(x, cos, sin, interleaved)\n        torch.testing.assert_close(y, ref, rtol=1e-5, atol=1e-6)\n        torch.testing.assert_close(y.square().sum(-1), x.square().sum(-1),\n                                   rtol=1e-5, atol=1e-5)\n        print(f\"passed: interleaved={interleaved}\")\n\n\nif __name__ == \"__main__\":\n    assert torch.cuda.is_available()\n    torch.manual_seed(0)\n    check()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "频率表与通道布局都要对齐",
+        "body": "正确 θ 不能弥补配对索引错误。分别构造两种参考，不能只检查 shape。"
+      },
+      {
+        "title": "旋转符号要成对",
+        "body": "一个输出 a·cos−b·sin，另一个 a·sin+b·cos；两处都减号会失去正交性。"
+      },
+      {
+        "title": "position 不总是行号",
+        "body": "增量解码可从缓存长度开始，实际位置必须体现在 Cos/Sin 表中。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为何同时作用于 Q 和 K？",
+        "a": "两者的相对旋转影响点积，从而引入相对位置信息；本 kernel 可分别用于 Q 与 K。"
+      },
+      {
+        "q": "如何快速发现符号错误？",
+        "a": "检查 position=0 为恒等、每对或整行范数保持，再与正确布局参考逐元素比较。"
+      },
+      {
+        "q": "两种布局能随意互换吗？",
+        "a": "需同步调整特征排列、权重约定和频率映射，不能在已有模型里直接切换参数。"
+      }
+    ],
+    "checklist": [
+      "两个布局各自与参考比较。",
+      "检查 position=0 恒等与范数保持。",
+      "S=17 检查最后一个 pair block 的尾部。"
+    ],
+    "blanks": [
+      {
+        "prompt": "interleaved 的配对索引为 (2j, ______)。",
+        "answer": "2*j + 1",
+        "hint": "相邻两个通道。"
+      },
+      {
+        "prompt": "half-split 中与 j 配对的是 ______。",
+        "answer": "j + D//2",
+        "hint": "后半区同一相对位置。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方核心指令",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "RoFormer 原始论文",
+        "url": "https://arxiv.org/abs/2104.09864"
+      }
+    ]
+  },
+  {
+    "id": "P11",
+    "module": "M5",
+    "title": "Naive Attention",
+    "subtitle": "三步算清 QKᵀ、Softmax 与 PV",
+    "difficulty": "挑战",
+    "minutes": 65,
+    "tags": [
+      "Attention",
+      "GEMM",
+      "S² 中间量"
+    ],
+    "statement": "实现分阶段、非 causal scaled dot-product attention：QKᵀ 写出分数矩阵，逐行 Softmax 写出概率矩阵，最后乘 V。三个阶段全部使用 TileLang。保留 S×S 中间量以方便验证与比较下一题；naive 指计算图分阶段，不要求使用标量点积。",
+    "formula": "Scores=QKᵀ/√D；P=Softmax(Scores)；O=PV；P 转为 FP16 后参与第二次 GEMM。",
+    "inputs": "Q、K、V: [S,D]，连续 float16 CUDA 张量；B=H=1，D=64。",
+    "outputs": "O: [S,D] float16；临时 Scores[S,S] 为 FP32、P[S,S] 为 FP16。",
+    "constraints": [
+      "面向 NVIDIA SM80+，需要 CUDA 与 TileLang Tensor Core 编译链。",
+      "0<S≤2048、S%64=0、D=64；只处理完整 tile。",
+      "非 causal、无 dropout；不支持任意 mask、GQA/MQA、paged KV、变长序列或 backward。",
+      "GEMM 输入 FP16、累加 FP32；概率转 FP16 是显式精度边界，不等同于全 FP32 attention。",
+      "已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。"
+    ],
+    "approach": [
+      "QK 使用 64×64 输出 tile，共享内存存 FP16 Q/K，FP32 累加后乘 1/√D。",
+      "Softmax 一行一个 block，在 FP32 fragment 中稳定归一化，写出 FP16 概率。",
+      "PV 沿 S 维以 64 分块；共享内存加载 P/V，FP32 累加，最后转 FP16 输出。"
+    ],
+    "mapping": [
+      {
+        "cuda": "shared-memory tiled QKᵀ",
+        "tilelang": "T.copy + T.gemm(..., transpose_B=True)",
+        "why": "逻辑转置 K，不必另存转置矩阵。"
+      },
+      {
+        "cuda": "独立 row softmax kernel",
+        "tilelang": "第二个 T.prim_func + 两类 reduce",
+        "why": "便于分别定位数值与布局错误。"
+      },
+      {
+        "cuda": "沿 S 维循环累加 PV",
+        "tilelang": "T.Pipelined + T.gemm(ps,vs,acc)",
+        "why": "累加器只在循环前清零。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 三个 TileLang kernel",
+        "note": "完整脚本，逐阶段比较 Scores、P、O，参考显式复现 P→FP16。没有性能实测数据。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\n# B=H=1, D=64, S divisible by 64, non-causal, FP16 Q/K/V.\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_qk(S, D=64):\n    assert 0 < S <= 2048 and S % 64 == 0 and D == 64\n    @T.prim_func\n    def main(Q: T.Tensor((S, D), \"float16\"),\n             K: T.Tensor((S, D), \"float16\"),\n             Scores: T.Tensor((S, S), \"float32\")):\n        with T.Kernel(S // 64, S // 64, threads=128) as (kc, qr):\n            qs = T.alloc_shared((64, D), \"float16\")\n            ks = T.alloc_shared((64, D), \"float16\")\n            acc = T.alloc_fragment((64, 64), \"float32\")\n            T.copy(Q[qr * 64, 0], qs)\n            T.copy(K[kc * 64, 0], ks)\n            T.clear(acc)\n            T.gemm(qs, ks, acc, transpose_B=True)\n            for i, j in T.Parallel(64, 64):\n                acc[i, j] *= D ** -0.5\n            T.copy(acc, Scores[qr * 64, kc * 64])\n    return main\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_probability(S):\n    assert 0 < S <= 2048 and S % 64 == 0\n    BLOCK = 1 << (S - 1).bit_length()\n    @T.prim_func\n    def main(Scores: T.Tensor((S, S), \"float32\"),\n             P: T.Tensor((S, S), \"float16\")):\n        with T.Kernel(S, threads=128) as row:\n            v = T.alloc_fragment((1, BLOCK), \"float32\")\n            m = T.alloc_fragment((1,), \"float32\")\n            z = T.alloc_fragment((1,), \"float32\")\n            for j in T.Parallel(BLOCK):\n                v[0, j] = T.if_then_else(\n                    j < S, Scores[row, j], -T.infinity(\"float32\"))\n            T.reduce_max(v, m, dim=1)\n            for j in T.Parallel(BLOCK):\n                v[0, j] = T.exp(v[0, j] - m[0])\n            T.reduce_sum(v, z, dim=1)\n            for j in T.Parallel(BLOCK):\n                if j < S:\n                    P[row, j] = v[0, j] / z[0]\n    return main\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_pv(S, D=64):\n    assert 0 < S <= 2048 and S % 64 == 0 and D == 64\n    @T.prim_func\n    def main(P: T.Tensor((S, S), \"float16\"),\n             V: T.Tensor((S, D), \"float16\"),\n             O: T.Tensor((S, D), \"float16\")):\n        with T.Kernel(S // 64, threads=128) as qr:\n            ps = T.alloc_shared((64, 64), \"float16\")\n            vs = T.alloc_shared((64, D), \"float16\")\n            acc = T.alloc_fragment((64, D), \"float32\")\n            T.clear(acc)\n            for tile in T.Pipelined(S // 64, num_stages=1):\n                T.copy(P[qr * 64, tile * 64], ps)\n                T.copy(V[tile * 64, 0], vs)\n                T.gemm(ps, vs, acc)\n            T.copy(acc, O[qr * 64, 0])\n    return main\n\n\ndef check(S=256, D=64):\n    assert torch.cuda.is_available()\n    torch.backends.cuda.matmul.allow_tf32 = False\n    assert torch.cuda.get_device_capability()[0] >= 8, \"Use SM80+\"\n    q, k, v = [torch.randn((S, D), device=\"cuda\", dtype=torch.float16)\n               for _ in range(3)]\n    scores = torch.empty((S, S), device=\"cuda\", dtype=torch.float32)\n    p = torch.empty((S, S), device=\"cuda\", dtype=torch.float16)\n    out = torch.empty_like(q)\n    qk, sm, pv = make_qk(S, D), make_probability(S), make_pv(S, D)\n    qk(q, k, scores)\n    sm(scores, p)\n    pv(p, v, out)\n    ref_scores = q.float() @ k.float().T / (D ** 0.5)\n    ref_p = torch.softmax(ref_scores, dim=-1)\n    # Match the explicit FP16 probability boundary.\n    ref_out = (ref_p.half().float() @ v.float()).half()\n    torch.testing.assert_close(scores, ref_scores, rtol=2e-3, atol=2e-3)\n    torch.testing.assert_close(p.float(), ref_p, rtol=2e-3, atol=2e-4)\n    torch.testing.assert_close(out, ref_out, rtol=2e-2, atol=2e-2)\n    print(\"three-stage attention passed\")\n\n\nif __name__ == \"__main__\":\n    torch.manual_seed(0)\n    check()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "缩放只能做一次",
+        "body": "1/√D 作用于 QKᵀ 分数再进入 Softmax；忘记缩放或第二次 GEMM 再缩放都改变结果。"
+      },
+      {
+        "title": "矩阵朝向",
+        "body": "K 存储仍为 [S,D]，第一步需要 transpose_B=True；PV 是 [S,S]×[S,D]，无需转置。"
+      },
+      {
+        "title": "S² 中间空间",
+        "body": "Scores 和 P 约占 6S² 字节临时空间，写出后还要重读；长序列不能只关注 GEMM 算力。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为何先写分阶段版本？",
+        "a": "分别验证维度、缩放、精度与输出，形成与融合版本比较的可解释基线。"
+      },
+      {
+        "q": "为什么 P 使用 FP16？",
+        "a": "让第二次 T.gemm 使用 FP16 输入和 FP32 累加；它引入量化误差，参考必须包含此边界。"
+      },
+      {
+        "q": "能在每次 KV tile 清零输出 acc 吗？",
+        "a": "不能，PV 需沿整个 S 累加，只在循环前清零一次。"
+      }
+    ],
+    "checklist": [
+      "先比较 Scores，再比较 P，最后比较 O。",
+      "核对 FP16 输入、D=64、S%64=0、SM80+。",
+      "参考包含概率转换；计时排除编译与内存分配。"
+    ],
+    "blanks": [
+      {
+        "prompt": "Q/K 均按 [S,D] 存储，QKᵀ 应传 transpose_B=______。",
+        "answer": "True",
+        "hint": "逻辑 B 操作数需要转置。"
+      },
+      {
+        "prompt": "PV 的 acc 清零放在 tile 循环的 ______。",
+        "answer": "之前",
+        "hint": "每个 tile 都贡献输出一部分。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方核心指令",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方归约源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方 GEMM 快速示例",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/examples/quickstart.py"
+      },
+      {
+        "label": "Attention Is All You Need",
+        "url": "https://arxiv.org/abs/1706.03762"
+      }
+    ]
+  },
+  {
+    "id": "P12",
+    "module": "M5",
+    "title": "Tiled FlashAttention",
+    "subtitle": "维护 m、l、O，省掉全局 S² 中间矩阵",
+    "difficulty": "挑战",
+    "minutes": 90,
+    "tags": [
+      "Online Softmax",
+      "融合 Attention",
+      "Tensor Core"
+    ],
+    "statement": "固定 query tile，遍历 KV tile，每次计算一块分数并更新 online softmax 状态。不再把完整 Scores 或 P 写入显存。教学实现保留核心数值递推和两次 GEMM，KV 循环串行执行；没有声称替代经过调优的完整 FlashAttention 库。",
+    "formula": "m′=max(m,max(s_t))；α=exp(m−m′)；p_t=exp(s_t−m′)；l′=α·l+Σp_t；A′=α·A+p_t·V_t；最终 O=A/l；s_t=Q·K_tᵀ/√D。",
+    "inputs": "Q、K、V: [S,64]，连续 float16 CUDA 张量；B=H=1，所有 token 互相可见。",
+    "outputs": "O: [S,64] float16；每个 block 只保存当前 tile、输出累加器和行状态。",
+    "constraints": [
+      "NVIDIA SM80+；BM=BN=D=64，S>0 且 S%64=0。",
+      "非 causal、无 dropout、无任意 mask；不支持 GQA/MQA、paged KV、变长、backward。",
+      "输入有限且每行至少有一个可见 key；没有全掩码行处理。",
+      "Q/K/V 和临时 GEMM 概率输入 FP16；分数、分母、输出累加器 FP32；概率转换引入近似误差。",
+      "T.serial KV 循环，没有声称流水线重叠、warp specialization 或达到峰值性能。",
+      "已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。"
+    ],
+    "approach": [
+      "一个 block 固定 64 个 query，在开始时加载 Q。",
+      "逐块读取 K/V，计算缩放分数，合并新旧最大值。",
+      "用 alpha 同时重标定旧分母与旧输出分子，再累加本块权重和加权 V。",
+      "全部 key 处理完后只除一次分母，再写输出；后续可研究 pipeline 与 tile 调优。"
+    ],
+    "mapping": [
+      {
+        "cuda": "Q/K/V shared tiles + Tensor Core",
+        "tilelang": "T.alloc_shared + T.gemm",
+        "why": "显式表达复用层级，编译器处理线程布局与同步。"
+      },
+      {
+        "cuda": "running max / running sum",
+        "tilelang": "FP32 fragment + 两类 reduce",
+        "why": "行状态随 BM 增长，不需全局 S² 存储。"
+      },
+      {
+        "cuda": "旧输出 accumulator 重标定",
+        "tilelang": "out*=alpha 后 T.gemm(ps,vs,out)",
+        "why": "保证旧分子与新分子处于同一指数基准。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 非 causal Online Softmax",
+        "note": "完整脚本；依据官方示例原理简化为单 batch/head、固定维度、串行 tile 循环。FP32 参考用于容差比较，不声称逐位一致。已核对官方 API 并通过 Python 语法检查；本环境未安装 TileLang/PyTorch，未进行 GPU 编译、正确性运行或性能实测。",
+        "code": "# Status: syntax checked only; not compiled or run on a GPU here.\n# B=H=1, D=64, S divisible by 64, non-causal, NVIDIA SM80+.\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\n@tilelang.jit(target=\"cuda\")\ndef make_flash_attention(S, D=64):\n    assert S > 0 and S % 64 == 0 and D == 64\n    BM, BN = 64, 64\n    SCALE = D ** -0.5\n\n    @T.prim_func\n    def main(Q: T.Tensor((S, D), \"float16\"),\n             K: T.Tensor((S, D), \"float16\"),\n             V: T.Tensor((S, D), \"float16\"),\n             O: T.Tensor((S, D), \"float16\")):\n        with T.Kernel(S // BM, threads=128) as qb:\n            qs = T.alloc_shared((BM, D), \"float16\")\n            ks = T.alloc_shared((BN, D), \"float16\")\n            vs = T.alloc_shared((BN, D), \"float16\")\n            ps = T.alloc_shared((BM, BN), \"float16\")\n            score = T.alloc_fragment((BM, BN), \"float32\")\n            out = T.alloc_fragment((BM, D), \"float32\")\n            running_m = T.alloc_fragment((BM,), \"float32\")\n            running_l = T.alloc_fragment((BM,), \"float32\")\n            merged_m = T.alloc_fragment((BM,), \"float32\")\n            tile_l = T.alloc_fragment((BM,), \"float32\")\n            alpha = T.alloc_fragment((BM,), \"float32\")\n            T.copy(Q[qb * BM, 0], qs)\n            T.clear(out)\n            T.clear(running_l)\n            T.fill(running_m, -T.infinity(\"float32\"))\n            # Serial loop exposes dependencies of the online state.\n            for kv in T.serial(S // BN):\n                T.copy(K[kv * BN, 0], ks)\n                T.copy(V[kv * BN, 0], vs)\n                T.clear(score)\n                T.gemm(qs, ks, score, transpose_B=True,\n                       policy=T.GemmWarpPolicy.FullRow)\n                for i, j in T.Parallel(BM, BN):\n                    score[i, j] *= SCALE\n                T.reduce_max(score, merged_m, dim=1)\n                for i in T.Parallel(BM):\n                    merged_m[i] = T.max(running_m[i], merged_m[i])\n                    alpha[i] = T.exp(running_m[i] - merged_m[i])\n                for i, j in T.Parallel(BM, BN):\n                    score[i, j] = T.exp(score[i, j] - merged_m[i])\n                T.reduce_sum(score, tile_l, dim=1)\n                for i in T.Parallel(BM):\n                    running_l[i] = alpha[i] * running_l[i] + tile_l[i]\n                    running_m[i] = merged_m[i]\n                # Rescale the old numerator BEFORE adding this tile.\n                for i, d in T.Parallel(BM, D):\n                    out[i, d] *= alpha[i]\n                T.copy(score, ps)  # FP32 weights -> FP16 GEMM input.\n                T.gemm(ps, vs, out, policy=T.GemmWarpPolicy.FullRow)\n            for i, d in T.Parallel(BM, D):\n                out[i, d] /= running_l[i]\n            T.copy(out, O[qb * BM, 0])\n    return main\n\n\ndef check(S=256, D=64):\n    assert torch.cuda.is_available()\n    torch.backends.cuda.matmul.allow_tf32 = False\n    assert torch.cuda.get_device_capability()[0] >= 8, \"Use SM80+\"\n    q, k, v = [torch.randn((S, D), device=\"cuda\", dtype=torch.float16)\n               for _ in range(3)]\n    out = torch.empty_like(q)\n    make_flash_attention(S, D)(q, k, v, out)\n    logits = (q.float() @ k.float().T) / (D ** 0.5)\n    ref = (torch.softmax(logits, -1) @ v.float()).half()\n    # FP16 unnormalized tile weights are an approximation boundary.\n    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)\n    assert torch.isfinite(out).all()\n    print(\"online attention passed\")\n\n\nif __name__ == \"__main__\":\n    torch.manual_seed(0)\n    check(64)\n    check(256)\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "只更新分母不够",
+        "body": "最大值变为 m′ 时，旧分母 l 和旧分子 A 都要乘 exp(m−m′)；漏掉其中一个会改变最终比值。"
+      },
+      {
+        "title": "不能逐块归一化后直接相加",
+        "body": "局部 Softmax 各自除以局部分母后相加，不等于全局 Softmax。应累加共同基准下的未归一化分子，最后除一次。"
+      },
+      {
+        "title": "exp 与 exp2 的底数",
+        "body": "本代码统一 exp。换 exp2 时分数及最大值差都要乘 log2(e)，alpha 与本块权重必须一致。"
+      },
+      {
+        "title": "概率 FP16 边界",
+        "body": "分母按 FP32 求和，第二次 GEMM 的权重为 FP16。应实测误差，不能把容差检查描述为逐位等价。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么不再需要 S² 空间？",
+        "a": "分数与概率只保留当前 BM×BN tile，行状态为 BM，输出累加器为 BM×D；全局只需输入与输出。"
+      },
+      {
+        "q": "新 tile 出现更大分数，旧结果怎么办？",
+        "a": "将旧分母和旧分子同时乘 exp(m−m′)，换到新基准，再加入 exp(s−m′) 的贡献。"
+      },
+      {
+        "q": "如何扩展 causal？",
+        "a": "按 query/key 全局位置屏蔽未来 key 并限制遍历范围；还要处理尾部、全掩码行、−Inf 指数差，不能只给输出乘三角 mask。"
+      }
+    ],
+    "checklist": [
+      "S=64 验证单 tile，S=256 验证多 tile。",
+      "检查 running_l 与旧 out 都乘 alpha，且 out 重标定在 GEMM 前。",
+      "对比 FP32 参考，记录 GPU、版本、dtype、误差与计时口径。"
+    ],
+    "blanks": [
+      {
+        "prompt": "最大值更新后，旧分子必须先乘 ______。",
+        "answer": "T.exp(running_m[i] - merged_m[i])",
+        "hint": "将旧指数基准换算到新基准。"
+      },
+      {
+        "prompt": "最终输出的分母是 ______。",
+        "answer": "running_l[i]",
+        "hint": "所有 KV tile 在共同基准下的权重和。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方核心指令",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方归约源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方 FlashAttention 示例（学习来源）",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/examples/flash_attention/example_mha_fwd_bshd.py"
+      },
+      {
+        "label": "FlashAttention 原始论文",
+        "url": "https://arxiv.org/abs/2205.14135"
+      },
+      {
+        "label": "FlashAttention-2 论文",
+        "url": "https://arxiv.org/abs/2307.08691"
+      }
+    ]
+  }
+]

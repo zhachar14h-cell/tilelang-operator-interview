@@ -1,0 +1,691 @@
+[
+  {
+    "id": "P01",
+    "module": "M0",
+    "title": "Bias + GELU 融合",
+    "subtitle": "从全局线性下标走到寄存器 tile",
+    "difficulty": "入门",
+    "minutes": 25,
+    "tags": [
+      "Elementwise",
+      "Fusion",
+      "Broadcast",
+      "Bandwidth"
+    ],
+    "statement": "给定行主序矩阵 X 和按列广播的 Bias，逐元素执行加法与 tanh 近似 GELU。把两步融合到一次 GPU 启动中，中间值不落到全局内存。先写可处理尾块的线性版本，再理解每个 block 处理一行中连续列的版本。",
+    "formula": "v = X[m,n] + Bias[n]; Y[m,n] = 0.5v · (1 + tanh(0.7978845608 · (v + 0.044715v³)))",
+    "inputs": "X: [M,N] float32、连续 row-major；Bias: [N] float32。题目规模 M=N=4096。",
+    "outputs": "Y: [M,N] float32，与输入位于同一 CUDA 设备。",
+    "constraints": [
+      "M、N 均为正整数；三个输入输出缓冲区不能相互别名。",
+      "V0 支持非整除形状，显式保护尾部。",
+      "V1 限定 N%1024==0、float32 连续张量；4096×4096 满足该条件。",
+      "采用题给 tanh 近似；不能拿 erf 版本作为相同公式的参考。",
+      "教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。"
+    ],
+    "approach": [
+      "V0 将 M×N 个位置展平；tile 内元素偏移 i 与 block 编号 bx 共同确定 idx。Bias 索引始终使用 idx%N。",
+      "V1 使用二维 grid：一维选择行，一维选择 1024 列。X、Bias 和输出 tile 都放入 fragment，完成计算后统一写回。",
+      "BLOCK 表示元素数，threads 表示线程数。1024 个元素由 256 个线程合作处理，i 不是线程编号。",
+      "以读 X 和写 Y 的 8MN 字节作为题目约定的有效数据量；Bias 的缓存流量与实际 DRAM 事务另算。tanh 的代价和启动开销仍需实测。"
+    ],
+    "mapping": [
+      {
+        "cuda": "blockIdx.x*blockDim.x+threadIdx.x",
+        "tilelang": "bx*BLOCK+i",
+        "why": "把逻辑元素范围写成 tile，编译器负责分配给线程。"
+      },
+      {
+        "cuda": "x[idx]+b[idx%N]",
+        "tilelang": "X[idx]+Bias[idx%N]",
+        "why": "广播是索引语义，展平后仍然要按列取 Bias。"
+      },
+      {
+        "cuda": "float4 / 每线程多个元素",
+        "tilelang": "fragment + T.copy(..., coalesced_width=4)",
+        "why": "给出连续访问提示；是否生成 128-bit 指令要检查生成源码。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "V0 · 线性 tile，显式尾部保护",
+        "note": "最接近 CUDA 基线，适合先核对索引。BLOCK 可与线程数不同。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_gelu_bias(M, N, BLOCK=256):\n    assert M > 0 and N > 0\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M * N,), \"float32\"),\n        Bias: T.Tensor((N,), \"float32\"),\n        Y: T.Tensor((M * N,), \"float32\"),\n    ):\n        with T.Kernel(T.ceildiv(M * N, BLOCK), threads=256) as bx:\n            for i in T.Parallel(BLOCK):\n                idx = bx * BLOCK + i\n                if idx < M * N:\n                    v = X[idx] + Bias[idx % N]\n                    u = 0.7978845608 * (v + 0.044715 * v * v * v)\n                    Y[idx] = 0.5 * v * (1.0 + T.tanh(u))\n\n    # 不设置 out_idx：调用者显式传入输出缓冲区。\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    # 同时覆盖题目尺寸与非整除尾部。\n    for M, N in [(4096, 4096), (7, 513)]:\n        x = torch.randn(M, N, device=\"cuda\", dtype=torch.float32)\n        bias = torch.randn(N, device=\"cuda\", dtype=torch.float32)\n        y = torch.empty_like(x)\n        kernel = make_gelu_bias(M, N)\n        kernel(x.view(-1), bias, y.view(-1))\n        v = x + bias\n        ref = 0.5 * v * (1.0 + torch.tanh(\n            0.7978845608 * (v + 0.044715 * v * v * v)))\n        torch.testing.assert_close(y, ref, rtol=1e-5, atol=1e-5)\n    print(\"GELU bias reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      },
+      {
+        "name": "V1 · 连续列 fragment",
+        "note": "限定 N 为 BLOCK 的倍数，减少教学代码中的尾部干扰。coalesced_width 是编译提示，不是带宽保证。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_gelu_bias(M, N, BLOCK=1024):\n    assert M > 0 and N % BLOCK == 0\n    assert BLOCK % (256 * 4) == 0\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Bias: T.Tensor((N,), \"float32\"),\n        Y: T.Tensor((M, N), \"float32\"),\n    ):\n        with T.Kernel(N // BLOCK, M, threads=256) as (bx, row):\n            x = T.alloc_fragment((BLOCK,), \"float32\")\n            b = T.alloc_fragment((BLOCK,), \"float32\")\n            y = T.alloc_fragment((BLOCK,), \"float32\")\n            col0 = bx * BLOCK\n            T.copy(X[row, col0], x, coalesced_width=4)\n            T.copy(Bias[col0], b, coalesced_width=4)\n            for i in T.Parallel(BLOCK):\n                v = x[i] + b[i]\n                u = 0.7978845608 * (v + 0.044715 * v * v * v)\n                y[i] = 0.5 * v * (1.0 + T.tanh(u))\n            T.copy(y, Y[row, col0], coalesced_width=4)\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    M = N = 4096\n    x = torch.randn(M, N, device=\"cuda\", dtype=torch.float32)\n    b = torch.randn(N, device=\"cuda\", dtype=torch.float32)\n    y = torch.empty_like(x)\n    kernel = make_gelu_bias(M, N)\n    kernel(x, b, y)\n    v = x + b\n    ref = 0.5 * v * (1.0 + torch.tanh(\n        0.7978845608 * (v + 0.044715 * v * v * v)))\n    torch.testing.assert_close(y, ref, rtol=1e-5, atol=1e-5)\n    # 可检查 kernel.get_kernel_source() 中的访存与寄存器使用。\n    print(\"GELU bias reference check passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "混淆 GELU 定义",
+        "body": "PyTorch 的默认 GELU 使用 erf 形式。这里按题给 tanh 多项式构造参考，避免把定义差异当成精度错误。"
+      },
+      {
+        "title": "把 tile 下标当线程号",
+        "body": "T.Parallel(1024) 代表 1024 个逻辑元素，不代表创建 1024 个线程。线程块的大小由 threads=256 指定。"
+      },
+      {
+        "title": "仅凭数据量宣布 memory-bound",
+        "body": "8MN 是有效带宽口径；实际吞吐还受 tanh、寄存器占用、缓存和启动时间影响。没有实测就不能声称接近峰值。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么按行分 tile 后不再需要取模？",
+        "a": "row 与 col0 已独立给出行列坐标，Bias 直接读取同一个列 tile。"
+      },
+      {
+        "q": "是否需要共享内存暂存 Bias？",
+        "a": "本实现中每个 block 只用一次该 Bias tile，共享内存会增加复制和同步；跨行复用能否受益应结合缓存与 tile 设计测量。"
+      },
+      {
+        "q": "如何计算题目约定的有效带宽？",
+        "a": "BW=8MN/秒。M=N=4096 时有效字节为 128 MiB；时间必须用预热后的 GPU 计时。"
+      }
+    ],
+    "checklist": [
+      "核对 tanh 近似与常数。",
+      "用非整除 M、N 验证 V0 尾部。",
+      "检查 V1 的整除、连续性和对齐前提。",
+      "编译和输入分配放到性能计时之外。"
+    ],
+    "blanks": [
+      {
+        "prompt": "展平后的列号 col = ____。",
+        "answer": "idx % N",
+        "hint": "一行有 N 个连续元素。"
+      },
+      {
+        "prompt": "1024 个元素、256 个线程，平均每线程负责 ____ 个元素。",
+        "answer": "4",
+        "hint": "逻辑 tile 大小除以线程数；具体映射仍由编译器决定。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：逐元素算子与 tile 到线程的映射",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/deeplearning_operators/elementwise.md"
+      },
+      {
+        "label": "TileLang 官方：指令、访存与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方源码：compile 与输出参数",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/jit/__init__.py"
+      }
+    ]
+  },
+  {
+    "id": "P02",
+    "module": "M0",
+    "title": "矩阵转置",
+    "subtitle": "让输入与输出都沿连续方向访问",
+    "difficulty": "入门",
+    "minutes": 30,
+    "tags": [
+      "Transpose",
+      "Shared memory",
+      "Coalescing",
+      "Layout"
+    ],
+    "statement": "把连续行主序矩阵 X[M,N] 转为独立、连续的 Y[N,M]，满足 Y[n,m]=X[m,n]。先写直接索引版本，再用共享内存改变 tile 的访问方向。这里实现物理转置，输出不是只修改 stride 的视图。",
+    "formula": "Y[n,m] = X[m,n]",
+    "inputs": "X: [M,N] float32，连续 row-major。",
+    "outputs": "Y: [N,M] float32，独立连续缓冲区。",
+    "constraints": [
+      "M、N>0，支持非 32 倍数的边缘 tile。",
+      "输入输出不得别名；本题不处理原地转置。",
+      "共享内存版本使用两个 32×32 float32 tile，共 8 KiB 逻辑存储，不含编译器可能增加的空间。",
+      "教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。"
+    ],
+    "approach": [
+      "直接版本写明输入与输出的下标交换，作为数值基线。行主序下，同时让两侧都按连续地址访问需要重新分配数据。",
+      "共享内存版本把 32×32 输入 tile 载入 smem，再用 T.transpose 转到另一个共享 tile，最后按输出行的连续方向写回。",
+      "输入、输出的边界分别由它们的全局坐标判断。转置同时交换 tile 内索引和 tile 的全局起点。",
+      "默认编译流程为跨线程共享内存依赖插入同步。进一步使用自定义布局处理 bank 冲突前，应先确认生成代码与性能瓶颈。"
+    ],
+    "mapping": [
+      {
+        "cuda": "tile[ty][tx] 再读 tile[tx][ty]",
+        "tilelang": "T.transpose(src_shared, dst_shared)",
+        "why": "表达 tile 内重排，随后可采用适合输出的线程映射。"
+      },
+      {
+        "cuda": "grid 按输入 tile 划分",
+        "tilelang": "T.Kernel(ceildiv(N,32),ceildiv(M,32))",
+        "why": "bx 沿输入列，by 沿输入行；输出起点为 (bx*32,by*32)。"
+      },
+      {
+        "cuda": "__syncthreads()",
+        "tilelang": "默认 ThreadSync pass",
+        "why": "共同写入共享内存后，跨线程消费必须建立可见性。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "V0 · 直接索引",
+        "note": "以最少结构核对坐标；读写中至少一侧的连续性受线程布局制约，不保证高性能。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_transpose(M, N, TILE=32):\n    assert M > 0 and N > 0\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Y: T.Tensor((N, M), \"float32\"),\n    ):\n        with T.Kernel(\n            T.ceildiv(N, TILE), T.ceildiv(M, TILE), threads=256\n        ) as (bx, by):\n            for i, j in T.Parallel(TILE, TILE):\n                row = by * TILE + i\n                col = bx * TILE + j\n                if row < M and col < N:\n                    Y[col, row] = X[row, col]\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    # 矩形、边缘和整齐尺寸都进入同一套验证流程。\n    for M, N in [(37, 65), (257, 129), (1024, 2048)]:\n        x = torch.arange(M * N, device=\"cuda\", dtype=torch.float32)\n        x = x.reshape(M, N)\n        y = torch.empty(N, M, device=\"cuda\", dtype=torch.float32)\n        kernel = make_transpose(M, N)\n        kernel(x, y)\n        ref = x.t().contiguous()\n        torch.testing.assert_close(y, ref, rtol=0, atol=0)\n        assert y.is_contiguous()\n    print(\"Transpose reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      },
+      {
+        "name": "V1 · 共享内存重排",
+        "note": "使用官方 T.transpose 处理二维共享 tile。Bank conflict 与布局需通过生成代码和 profiler 验证。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_transpose(M, N, TILE=32):\n    assert M > 0 and N > 0\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Y: T.Tensor((N, M), \"float32\"),\n    ):\n        with T.Kernel(\n            T.ceildiv(N, TILE), T.ceildiv(M, TILE), threads=256\n        ) as (bx, by):\n            src = T.alloc_shared((TILE, TILE), \"float32\")\n            dst = T.alloc_shared((TILE, TILE), \"float32\")\n            # 所有 src 元素都定义；边缘位置补零。\n            for i, j in T.Parallel(TILE, TILE):\n                row = by * TILE + i\n                col = bx * TILE + j\n                if row < M and col < N:\n                    src[i, j] = X[row, col]\n                else:\n                    src[i, j] = 0.0\n            # dst[j,i] = src[i,j]，默认流程负责共享内存同步。\n            T.transpose(src, dst)\n            for i, j in T.Parallel(TILE, TILE):\n                out_row = bx * TILE + i\n                out_col = by * TILE + j\n                if out_row < N and out_col < M:\n                    Y[out_row, out_col] = dst[i, j]\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    for M, N in [(37, 65), (257, 129), (1024, 2048)]:\n        x = torch.randn(M, N, device=\"cuda\", dtype=torch.float32)\n        y = torch.empty(N, M, device=\"cuda\", dtype=torch.float32)\n        kernel = make_transpose(M, N)\n        kernel(x, y)\n        torch.testing.assert_close(y, x.t().contiguous(), rtol=0, atol=0)\n    print(\"Shared transpose reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "只交换 tile 内坐标",
+        "body": "tile 的全局行列起点也必须交换。仅把 src[i,j] 换成 src[j,i] 会把数据放到错误的大块。"
+      },
+      {
+        "title": "共享内存不自动等于无冲突",
+        "body": "本版本没有强行声明达到最优布局。共享数组的物理布局、线程映射和 bank 冲突都要通过编译产物与 profiling 评估。"
+      },
+      {
+        "title": "把转置视图当作物理转置",
+        "body": "x.t() 通常只改变张量 stride。参考加 contiguous() 才与独立连续输出的契约相同。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么选择矩形输入做测试？",
+        "a": "方阵容易掩盖行列起点交换错误；37×65 还会同时覆盖两个方向的边缘。"
+      },
+      {
+        "q": "两块共享 tile 是最省内存的方案吗？",
+        "a": "不是。这种写法让重排语义清楚；更节省的布局、视图或原地块内重排需要额外证明和测量。"
+      },
+      {
+        "q": "为什么数值检查可用零容差？",
+        "a": "转置只搬运 float32 比特，不进行浮点算术；对于有限测试数据应逐值完全相同。"
+      }
+    ],
+    "checklist": [
+      "Y 的形状为 [N,M] 且连续。",
+      "使用 M!=N 的输入验证全局坐标。",
+      "验证两个方向都不整除 TILE 的边缘。",
+      "输出缓冲区与输入不重叠。"
+    ],
+    "blanks": [
+      {
+        "prompt": "输入 tile 起点为 (by*T,bx*T)，输出 tile 起点应为 ____。",
+        "answer": "(bx*T, by*T)",
+        "hint": "转置交换行列。"
+      },
+      {
+        "prompt": "32×32 的 float32 tile 占 ____ 字节。",
+        "answer": "4096",
+        "hint": "每个 float32 为 4 字节。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：指令、访存与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方：共享视角、内存作用域与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/language_basics.md"
+      }
+    ]
+  },
+  {
+    "id": "P03",
+    "module": "M1",
+    "title": "全局 Reduce Sum",
+    "subtitle": "把 block 内归约和全局同步分开",
+    "difficulty": "进阶",
+    "minutes": 35,
+    "tags": [
+      "Reduction",
+      "Two-stage",
+      "Neutral element",
+      "Synchronization"
+    ],
+    "statement": "对一维 float32 输入求和。第一阶段每个 block 产生一个部分和，第二阶段由一个 block 归约所有部分和。完整脚本包括临时缓冲区、两次编译与按依赖顺序调用，避免把 block 内归约误当作整个 GPU 的归约。",
+    "formula": "Partial[b] = Σ X[b·BLOCK+i]; Y[0] = Σ Partial[b]",
+    "inputs": "X: [N] float32，连续 CUDA 张量。",
+    "outputs": "Y: [1] float32；中间 Partial: [ceildiv(N,BLOCK)]。",
+    "constraints": [
+      "BLOCK=1024，1<=N<=BLOCK²，保证第二阶段能装入单个 tile。",
+      "输入只含有限值；空输入需要主机侧单独定义零和，本脚本明确拒绝。",
+      "归约使用 float32；并行加法次序与 PyTorch 不同，因此使用容差验证。",
+      "两次启动必须按同一执行流的依赖顺序执行；脚本采用默认调用顺序。",
+      "教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。"
+    ],
+    "approach": [
+      "构造一个通用的 block_sum 工厂：每个 block 将至多 BLOCK 个元素写入 [1,BLOCK] fragment，尾部写零。",
+      "调用 T.reduce_sum(...,dim=1)，输出形状是 [1]，再写到本 block 唯一的部分和位置。",
+      "第一阶段处理原数组，第二阶段复用相同工厂处理 Partial；第二阶段的 grid 恰好为 1。",
+      "N>BLOCK² 时需要继续递归地归约 partial，直到只剩一个结果。不能让第二阶段只看前 BLOCK 个部分和。",
+      "整体还会读写部分和并多一次 kernel 启动，带宽计算不能只看最终输出大小。"
+    ],
+    "mapping": [
+      {
+        "cuda": "warp shuffle + shared block sum",
+        "tilelang": "T.reduce_sum(tile, scalar, dim=1)",
+        "why": "显式声明归约轴，线程内与线程间归约由编译器展开。"
+      },
+      {
+        "cuda": "临时数组 + 第二个 kernel",
+        "tilelang": "stage1(X,Partial); stage2(Partial,Y)",
+        "why": "不同 block 之间的完成顺序通过启动依赖建立。"
+      },
+      {
+        "cuda": "尾部线程加入 0",
+        "tilelang": "无效 tile 元素写 0.0",
+        "why": "加法单位元不改变归约值。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "V0 · 完整两阶段调用",
+        "note": "包含工作区分配与第二次启动，限定最多 1024 个第一阶段 block。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_block_sum(N, BLOCK=1024):\n    assert N > 0\n    P = (N + BLOCK - 1) // BLOCK\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((N,), \"float32\"),\n        Partial: T.Tensor((P,), \"float32\"),\n    ):\n        with T.Kernel(P, threads=256) as bx:\n            values = T.alloc_fragment((1, BLOCK), \"float32\")\n            total = T.alloc_fragment((1,), \"float32\")\n            for i, j in T.Parallel(1, BLOCK):\n                idx = bx * BLOCK + j\n                if idx < N:\n                    values[i, j] = X[idx]\n                else:\n                    values[i, j] = 0.0\n            T.reduce_sum(values, total, dim=1)\n            for i in T.Parallel(1):\n                Partial[bx] = total[i]\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef prepare_two_stage(N, device, BLOCK=1024):\n    assert 1 <= N <= BLOCK * BLOCK\n    P = (N + BLOCK - 1) // BLOCK\n    partial = torch.empty(P, device=device, dtype=torch.float32)\n    y = torch.empty(1, device=device, dtype=torch.float32)\n    stage1 = make_block_sum(N, BLOCK)\n    stage2 = make_block_sum(P, BLOCK)\n    # 返回已编译 kernel 与已分配工作区，方便放到计时外。\n    return stage1, stage2, partial, y\n\n\ndef main():\n    torch.manual_seed(0)\n    for N in [1, 1025, 1_000_003]:\n        x = torch.randn(N, device=\"cuda\", dtype=torch.float32)\n        stage1, stage2, partial, y = prepare_two_stage(N, x.device)\n        # 同一执行流按顺序启动；第二阶段消费第一阶段结果。\n        stage1(x, partial)\n        stage2(partial, y)\n        ref = x.sum().reshape(1)\n        torch.testing.assert_close(y, ref, rtol=1e-4, atol=1e-2)\n    print(\"Two-stage reduce-sum reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "第二阶段没有覆盖全部 partial",
+        "body": "示例为完整两阶段而限制 N<=1024²。超出此范围必须添加递归阶段，不能保持第二阶段单 tile 却忽略剩余元素。"
+      },
+      {
+        "title": "使用 block 屏障做全局同步",
+        "body": "块内同步只能协调一个 block。第二次 kernel 启动及流顺序才是此实现的全局依赖边界。"
+      },
+      {
+        "title": "要求 float32 串行同序结果",
+        "body": "加法不满足浮点结合律。两阶段树形求和与参考实现可能有舍入差异，绝不能用逐比特相等作为唯一标准。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么不用 atomic_add 写一个全局标量？",
+        "a": "可以设计原子版本，但每次运行前要清零，竞争和不固定加法顺序也会影响性能与误差；这里用两阶段让依赖与结果所有权更清楚。"
+      },
+      {
+        "q": "如果只剩一个 partial 还需要第二次启动吗？",
+        "a": "语义上可以直接返回该 partial；示例统一保留两阶段，实际调度器可以为 P=1 省去启动。"
+      },
+      {
+        "q": "如何扩展到任意正整数 N？",
+        "a": "重复编译或缓存 block_sum(当前长度)，每轮把 ceildiv(当前长度,BLOCK) 个结果交给下一轮，直到长度为 1，并保留各轮工作区的生命周期。"
+      }
+    ],
+    "checklist": [
+      "尾部填 0，不能读取未初始化 fragment。",
+      "Partial 长度等于 ceildiv(N,BLOCK)。",
+      "第二阶段输入长度是 P，不是原来的 N。",
+      "测试 N=1、BLOCK+1 和大规模非整除输入。"
+    ],
+    "blanks": [
+      {
+        "prompt": "sum 的无效元素应填 ____。",
+        "answer": "0",
+        "hint": "寻找加法单位元。"
+      },
+      {
+        "prompt": "BLOCK=1024，N=1,000,003 时第一阶段产生 ____ 个部分和。",
+        "answer": "977",
+        "hint": "向上整除；976×1024=999424。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方源码：reduce_sum / max / min",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方：指令、访存与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方源码：compile 与输出参数",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/jit/__init__.py"
+      }
+    ]
+  },
+  {
+    "id": "P04",
+    "module": "M1",
+    "title": "按行 Sum / Max 工具箱",
+    "subtitle": "相同 tile，不同单位元与输出形状",
+    "difficulty": "入门",
+    "minutes": 25,
+    "tags": [
+      "Row reduction",
+      "Sum",
+      "Max",
+      "Mask"
+    ],
+    "statement": "给定 X[M,N]，每行分别输出元素和与最大值。一个 block 负责一行，使用两个 fragment 对尾部采用不同的中性填充值。这道题是 Softmax、LayerNorm 和 Argmax 的基础。",
+    "formula": "Sum[m] = Σₙ X[m,n]; Max[m] = maxₙ X[m,n]",
+    "inputs": "X: [M,N] float32，连续 CUDA 张量。",
+    "outputs": "Sum: [M] float32；Max: [M] float32。",
+    "constraints": [
+      "M>0，1<=N<=4096；BLOCK 取不小于 N 的最小二次幂。",
+      "输入值有限，不承诺含 NaN 时的传播规则。",
+      "一行由一个 block 处理；超长行需要分段归约与第二阶段。",
+      "教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。"
+    ],
+    "approach": [
+      "把一行加载到 [1,BLOCK] fragment；另一个 fragment 持有供 max 使用的副本。",
+      "合法位置都读取 X[row,j]；无效位置在 sum fragment 中写 0，在 max fragment 中写 -∞。",
+      "T.reduce_sum 与 T.reduce_max 都沿 dim=1，输出均为 [1] fragment，再写到全局的 row 位置。",
+      "单 block 每行是清楚的基线。短行时可以尝试一块多行，长行时考虑分段，是否有收益由资源占用和吞吐决定。"
+    ],
+    "mapping": [
+      {
+        "cuda": "每个 block 处理一行",
+        "tilelang": "T.Kernel(M) as row",
+        "why": "归约范围与 block 的工作范围一致，输出拥有唯一写入者。"
+      },
+      {
+        "cuda": "sum identity=0, max identity=-∞",
+        "tilelang": "分别构造 xs 与 xm 的尾部",
+        "why": "同一补零策略不能同时服务两种归约。"
+      },
+      {
+        "cuda": "warp / block reduce toolkit",
+        "tilelang": "T.reduce_sum / T.reduce_max",
+        "why": "同一个归约接口使用不同运算与单位元。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "V0 · 双归约基线",
+        "note": "用独立的单位元处理非整除 N，并加入全负数测试。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_row_stats(M, N):\n    assert M > 0 and 1 <= N <= 4096\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Sum: T.Tensor((M,), \"float32\"),\n        Max: T.Tensor((M,), \"float32\"),\n    ):\n        with T.Kernel(M, threads=256) as row:\n            xs = T.alloc_fragment((1, BLOCK), \"float32\")\n            xm = T.alloc_fragment((1, BLOCK), \"float32\")\n            s = T.alloc_fragment((1,), \"float32\")\n            m = T.alloc_fragment((1,), \"float32\")\n            for i, j in T.Parallel(1, BLOCK):\n                if j < N:\n                    xs[i, j] = X[row, j]\n                    xm[i, j] = X[row, j]\n                else:\n                    xs[i, j] = 0.0\n                    xm[i, j] = -T.infinity(\"float32\")\n            T.reduce_sum(xs, s, dim=1)\n            T.reduce_max(xm, m, dim=1)\n            for i in T.Parallel(1):\n                Sum[row] = s[i]\n                Max[row] = m[i]\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    for M, N in [(257, 1001), (17, 4096), (5, 1)]:\n        x = torch.randn(M, N, device=\"cuda\", dtype=torch.float32)\n        # 确保错误地以 0 填充 max 时会被发现。\n        x[0] = -x[0].abs() - 1.0\n        sums = torch.empty(M, device=\"cuda\", dtype=torch.float32)\n        maxima = torch.empty_like(sums)\n        kernel = make_row_stats(M, N)\n        kernel(x, sums, maxima)\n        torch.testing.assert_close(sums, x.sum(dim=1), rtol=1e-4, atol=1e-3)\n        torch.testing.assert_close(maxima, x.amax(dim=1), rtol=0, atol=0)\n    print(\"Row sum/max reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "Max 尾部填零",
+        "body": "当整行都是负数，零会错误地成为最大值。这里的 max padding 必须为 -∞。"
+      },
+      {
+        "title": "归约轴写反",
+        "body": "输入 fragment 为 [1,BLOCK]，要归约的是 dim=1，结果形状为 [1]。沿 dim=0 会留下整条列向量。"
+      },
+      {
+        "title": "无限扩大单行 tile",
+        "body": "把 BLOCK 从 4096 扩到几十万会增大寄存器压力，甚至编译失败。长度限制是本实现的契约。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么结果使用形状 [1] 而非 Python 标量？",
+        "a": "归约结果仍是 DSL 中的缓冲区，且可以按 tile 数据流接到后续计算；[1] 也明确表达去掉最后一维后的形状。"
+      },
+      {
+        "q": "sum 与 max 能共用同一个输入 fragment 吗？",
+        "a": "整除时可共用；有尾部时要在两次归约之间替换无效位置的单位元，或像本例保留两个版本。"
+      },
+      {
+        "q": "很短的 N 为什么可能浪费线程？",
+        "a": "每行固定 256 个线程，但有效元素可能很少；一块处理多行有机会增加有效工作，仍需用合适的布局和基准验证。"
+      }
+    ],
+    "checklist": [
+      "全负输入的 max 保持为负。",
+      "N 非二次幂时两种 padding 分别正确。",
+      "正确使用 dim=1 与 [1] 输出。",
+      "sum 使用容差；有限输入的 max 可精确比较。"
+    ],
+    "blanks": [
+      {
+        "prompt": "max 的尾部单位元为 ____。",
+        "answer": "-∞",
+        "hint": "它不应大于任何合法有限输入。"
+      },
+      {
+        "prompt": "[1,BLOCK] 沿 dim=1 归约，输出形状为 ____。",
+        "answer": "[1]",
+        "hint": "被归约维被移除。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方源码：reduce_sum / max / min",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方：指令、访存与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      }
+    ]
+  },
+  {
+    "id": "P05",
+    "module": "M1",
+    "title": "Max / Argmax",
+    "subtitle": "把重复最大值的第一位置写进契约",
+    "difficulty": "进阶",
+    "minutes": 30,
+    "tags": [
+      "Argmax",
+      "Tie break",
+      "Reduction",
+      "Index"
+    ],
+    "statement": "对 X[M,N] 的每一行返回最大值及其第一次出现的列号。把语义拆成两次归约：先求最大值，再对等于最大值的合法列号求最小值。该基线优先展示明确的 tie-break，不使用未核实的 argmax 专用接口。",
+    "formula": "V[m] = maxₙ X[m,n]; I[m] = min{n | X[m,n]=V[m]}",
+    "inputs": "X: [M,N] float32，连续 CUDA 张量。",
+    "outputs": "V: [M] float32；I: [M] int32，重复最大值返回最小列号。",
+    "constraints": [
+      "M>0，1<=N<=4096；输入必须为有限 float32 值。",
+      "列号用 int32，N 不得超出其可表示范围；本教学约束远低于该上限。",
+      "不定义 NaN 的排序、传播和 tie-break；加入 NaN 支持必须先补充完整语义。",
+      "每行由一个 block 处理；这里没有实现跨 block 的值-索引二元归约。",
+      "教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。"
+    ],
+    "approach": [
+      "把行补到二次幂 BLOCK，无效值用 -∞ 填充，先用 T.reduce_max 得到行最大值。",
+      "构造 int32 候选列号：合法且值等于最大值的位置写 j，其余写 2147483647。",
+      "T.reduce_min 对候选列号做归约，得到第一个最大值的位置。这是确定的 tie-break，而非依赖线程执行先后。",
+      "长行的跨块版本必须合并 (value,index) 对：优先较大 value，value 相等时选较小 index。仅对每块 index 求 min 会出错。"
+    ],
+    "mapping": [
+      {
+        "cuda": "比较 value,index 的二元归约",
+        "tilelang": "reduce_max 后 reduce_min(candidate)",
+        "why": "把二元比较的语义拆成两个内置归约，接口简单、可验证。"
+      },
+      {
+        "cuda": "平值时选较小 idx",
+        "tilelang": "合法最大值写列号，其余写 INT_MAX",
+        "why": "最小值归约保证选择第一次出现的位置。"
+      },
+      {
+        "cuda": "invalid lane",
+        "tilelang": "值填 -∞，索引候选填 INT_MAX",
+        "why": "值域和索引域各自需要不会胜出的占位值。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "V0 · 两遍块内归约",
+        "note": "两次归约都在同一 kernel 内，整行只需从全局内存加载到 fragment。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_row_argmax(M, N):\n    assert M > 0 and 1 <= N <= 4096\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        V: T.Tensor((M,), \"float32\"),\n        I: T.Tensor((M,), \"int32\"),\n    ):\n        with T.Kernel(M, threads=256) as row:\n            x = T.alloc_fragment((1, BLOCK), \"float32\")\n            vmax = T.alloc_fragment((1,), \"float32\")\n            candidate = T.alloc_fragment((1, BLOCK), \"int32\")\n            first = T.alloc_fragment((1,), \"int32\")\n            for i, j in T.Parallel(1, BLOCK):\n                if j < N:\n                    x[i, j] = X[row, j]\n                else:\n                    x[i, j] = -T.infinity(\"float32\")\n            T.reduce_max(x, vmax, dim=1)\n            for i, j in T.Parallel(1, BLOCK):\n                candidate[i, j] = T.if_then_else(\n                    (j < N) & (x[i, j] == vmax[i]),\n                    j, 2147483647,\n                )\n            T.reduce_min(candidate, first, dim=1)\n            for i in T.Parallel(1):\n                V[row] = vmax[i]\n                I[row] = first[i]\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    M, N = 257, 1001\n    x = torch.randn(M, N, device=\"cuda\", dtype=torch.float32)\n    x[0] = -1.0\n    x[0, 5] = 10.0\n    x[0, 17] = 10.0  # 平值必须选择列 5。\n    x[1] = -3.0      # 整行平值必须选择列 0。\n    v = torch.empty(M, device=\"cuda\", dtype=torch.float32)\n    idx = torch.empty(M, device=\"cuda\", dtype=torch.int32)\n    kernel = make_row_argmax(M, N)\n    kernel(x, v, idx)\n    ref_v, ref_i = x.max(dim=1)\n    torch.testing.assert_close(v, ref_v, rtol=0, atol=0)\n    torch.testing.assert_close(idx, ref_i.to(torch.int32), rtol=0, atol=0)\n    print(\"Max / first-argmax reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "只求到最大值，位置靠猜",
+        "body": "最大值不携带其位置。相等判断后的候选索引归约是算法的一部分，不能省略。"
+      },
+      {
+        "title": "用 0 作为无效索引",
+        "body": "reduce_min 会把 0 当成最优候选。无效候选必须设为比任何合法列号都大的值。"
+      },
+      {
+        "title": "NaN 语义不明确",
+        "body": "NaN 与自身比较也不相等，本例的第二次归约将失去合法候选。输入契约明确排除 NaN；不能宣称支持所有 float32 比特模式。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么第二次归约使用 min？",
+        "a": "所有合法候选都已经具有同样的最大值，剩下的问题就是选择最小列号。"
+      },
+      {
+        "q": "一个 block 同时发现多个最大值会竞争写 I 吗？",
+        "a": "不会。候选先进入归约，最终只有归约结果位置的写回，不让多个线程分别写全局索引。"
+      },
+      {
+        "q": "跨块时如何保证第一位置？",
+        "a": "部分结果带全局列号。合并时先比较值，值相等时比较列号，并把这个比较规则用于所有层级。"
+      }
+    ],
+    "checklist": [
+      "覆盖两个位置共享最大值的行。",
+      "覆盖整行平值，结果应为 0。",
+      "非整除 N 的无效列永远不能胜出。",
+      "确认 int32 输出与 PyTorch int64 参考显式转换。"
+    ],
+    "blanks": [
+      {
+        "prompt": "非候选索引应填 ____，再执行 reduce_min。",
+        "answer": "INT_MAX / 2147483647",
+        "hint": "无效值不能小于合法列号。"
+      },
+      {
+        "prompt": "候选条件是 j<N 且 ____。",
+        "answer": "x[i,j] == vmax[i]",
+        "hint": "只有最大值所在位置参与索引竞选。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方源码：reduce_sum / max / min",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方：指令、访存与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      }
+    ]
+  },
+  {
+    "id": "P06",
+    "module": "M2",
+    "title": "Prefix Scan",
+    "subtitle": "理解 inclusive、exclusive 与跨块前缀",
+    "difficulty": "进阶",
+    "minutes": 40,
+    "tags": [
+      "Scan",
+      "Cumsum",
+      "Prefix",
+      "Shared memory"
+    ],
+    "statement": "对矩阵的每一行执行前缀和，分别实现 inclusive 与 exclusive 两种语义。教学实现把整行放进一个 block 的共享 tile，用 T.cumsum 得到 inclusive 结果，再按定义生成 exclusive 输出。此版本明确限制一行最多 1024 个元素。",
+    "formula": "Inclusive[m,j] = Σₖ₌₀ʲ X[m,k]; Exclusive[m,0]=0, Exclusive[m,j]=Σₖ₌₀ʲ⁻¹ X[m,k]",
+    "inputs": "X: [M,N] float32，连续 CUDA 张量。",
+    "outputs": "Y: [M,N] float32；factory 参数 exclusive 控制语义。",
+    "constraints": [
+      "M>0，1<=N<=1024；BLOCK 取不小于 N 的最小二次幂。",
+      "每行由一个 block 处理，脚本不实现跨 block 的全长 scan。",
+      "输入为有限值，float32 并行加法的舍入次序可能不同于 torch.cumsum。",
+      "inclusive 与 exclusive 是两个编译期变体；不要把 exclusive 错写成 reverse scan。",
+      "教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。"
+    ],
+    "approach": [
+      "加载一行到共享 tile，尾部补 0。T.cumsum(src=tile,dst=tile,dim=0) 就地写出 inclusive 前缀。",
+      "inclusive 直接写回；exclusive 的第 0 个结果为 0，其余结果读取 inclusive[j-1]。这样无需用减法从 inclusive 中扣除当前值。",
+      "共享内存让块内不同线程交换前缀状态，默认编译流程处理相关同步。T.cumsum 是 scan 原语，不是普通 sum 归约。",
+      "跨 block 的完整路线有三步：块内 scan 并保存块总和；对块总和做 exclusive scan；把对应块之前的总和加到每个块的局部输出。块总和太长时，这个过程继续递归。",
+      "不同 block 之间不能靠 T.tvm_storage_sync('shared') 协调。本脚本只展示单行单块，三阶段路线是扩展设计而不是已实现版本。"
+    ],
+    "mapping": [
+      {
+        "cuda": "Hillis–Steele / Blelloch 块内 scan",
+        "tilelang": "T.cumsum(shared,shared,dim=0)",
+        "why": "声明前缀依赖，具体扫描分解交给原语的后端实现。"
+      },
+      {
+        "cuda": "exclusive 前缀移位",
+        "tilelang": "j==0 ? 0 : inclusive[j-1]",
+        "why": "精确对应输出定义，并避免额外减法造成消去误差。"
+      },
+      {
+        "cuda": "block totals + uniform add",
+        "tilelang": "额外 totals scan 与 add kernels",
+        "why": "T.cumsum 的单个 block 不能自动传播其他 block 的前缀。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "V0 · 单行单块，双语义",
+        "note": "包含 inclusive 和 exclusive 的完整编译调用与 PyTorch 参考。跨块三阶段仅在思路中说明。教学脚本已做 Python 语法检查；当前环境没有 TileLang / PyTorch，未进行 GPU 编译、正确性运行或性能测量。",
+        "code": "# Python 语法已检查；未在 GPU 上验证。\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_row_scan(M, N, exclusive=False):\n    assert M > 0 and 1 <= N <= 1024\n    BLOCK = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Y: T.Tensor((M, N), \"float32\"),\n    ):\n        with T.Kernel(M, threads=256) as row:\n            values = T.alloc_shared((BLOCK,), \"float32\")\n            for j in T.Parallel(BLOCK):\n                if j < N:\n                    values[j] = X[row, j]\n                else:\n                    values[j] = 0.0\n            T.cumsum(src=values, dst=values, dim=0)\n            for j in T.Parallel(BLOCK):\n                if j < N:\n                    if exclusive:\n                        if j == 0:\n                            Y[row, j] = 0.0\n                        else:\n                            Y[row, j] = values[j - 1]\n                    else:\n                        Y[row, j] = values[j]\n\n    return tilelang.compile(main, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    for M, N in [(17, 1), (37, 257), (64, 1024)]:\n        x = torch.randn(M, N, device=\"cuda\", dtype=torch.float32)\n        inclusive = torch.cumsum(x, dim=1)\n        for exclusive in [False, True]:\n            y = torch.empty_like(x)\n            kernel = make_row_scan(M, N, exclusive)\n            kernel(x, y)\n            if exclusive:\n                ref = torch.cat(\n                    [torch.zeros_like(x[:, :1]), inclusive[:, :-1]], dim=1\n                )\n            else:\n                ref = inclusive\n            torch.testing.assert_close(y, ref, rtol=1e-4, atol=1e-3)\n    print(\"Inclusive / exclusive row-scan reference checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "把 inclusive 当成 exclusive",
+        "body": "输入 [2,3,5] 的 inclusive 是 [2,5,10]，exclusive 是 [0,2,5]。用很短的手算输入就能暴露偏移错误。"
+      },
+      {
+        "title": "每个块单独 scan 就结束",
+        "body": "这只能得到块内前缀。第二块开始前还必须加上前面所有块的总和，否则结果会在块边界重新归零。"
+      },
+      {
+        "title": "独立线程写全局前缀计数器",
+        "body": "原子加保证某种累加顺序，但这个顺序不等于输入下标顺序，不能直接替代稳定的前缀和。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么补零不会影响有效输出？",
+        "a": "scan 的第 j 个结果只依赖不超过 j 的位置。尾部填充值排在所有有效输入之后，且零是加法单位元。"
+      },
+      {
+        "q": "跨块的 offsets 应用 inclusive 还是 exclusive？",
+        "a": "应对块总和做 exclusive scan，让 block b 获得所有编号小于 b 的块的总和。"
+      },
+      {
+        "q": "为什么不通过 inclusive[j]-X[j] 生成 exclusive？",
+        "a": "代数上等价，但减法可能放大消去误差；读取前一个 inclusive 结果更直接地满足定义。"
+      },
+      {
+        "q": "T.cumsum 放在 fragment 上是否永远只用寄存器？",
+        "a": "不能这样假设。官方当前实现会对 fragment scan 暂存到共享内存；本例直接使用 shared，让资源含义清楚。"
+      }
+    ],
+    "checklist": [
+      "[2,3,5] 手算检查两种语义。",
+      "N=1 时 exclusive 输出必须全为 0。",
+      "验证 N=257 等非整除形状。",
+      "超过 1024 列时明确拒绝，扩展时补齐 totals scan 和 uniform add。"
+    ],
+    "blanks": [
+      {
+        "prompt": "[2,3,5] 的 exclusive scan 是 ____。",
+        "answer": "[0,2,5]",
+        "hint": "当前元素不参与当前前缀。"
+      },
+      {
+        "prompt": "给 block b 的补偿量应等于编号 ____ b 的所有块总和。",
+        "answer": "小于",
+        "hint": "当前块已经完成自身的局部 scan。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方源码：cumsum",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/scan_op.py"
+      },
+      {
+        "label": "TileLang 官方：指令、访存与同步",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      }
+    ]
+  }
+]
+

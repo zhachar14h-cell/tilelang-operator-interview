@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#182b27">
+  <meta name="description" content="18 道中文 TileLang 算子练习：从访存、归约到 FlashAttention，配有实现、填空、面试追问与学习进度。">
+  <title>TileLang 算子练习室</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="curriculum.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#content">跳到正文</a>
+  <div class="mobile-shade" id="mobile-shade"></div>
+  <aside class="sidebar" id="sidebar" aria-label="课程导航">
+    <a class="brand" href="#/" aria-label="TileLang 算子练习室首页"><span class="brand-mark">t<span>l</span></span><span>TileLang<b>算子练习室</b></span><span class="brand-edition">01</span></a>
+    <div class="side-label">YOUR KERNEL WORKBENCH</div>
+    <nav class="main-nav"><a href="#/" data-route="home"><span>⌂</span>学习总览</a><a href="#/guide" data-route="guide"><span>⌘</span>从 CUDA 到 TileLang</a><a href="#/lab" data-route="lab"><span>▦</span>Tile 与带宽实验台</a></nav>
+    <div class="side-section"><span>算子路线</span><span id="side-count">18 LESSONS</span></div>
+    <nav id="course-nav" class="course-nav" aria-label="题目列表"></nav>
+    <div class="side-bottom"><div><span class="live-dot"></span> 本地学习进度<span id="side-percent">0%</span></div><div class="progress-track"><i id="side-progress"></i></div><p id="side-progress-label">从第一道 kernel 开始。</p><button class="side-link" id="data-settings">导入 / 导出进度 <span>↗</span></button></div>
+  </aside>
+  <header class="topbar"><button class="icon-button mobile-menu" id="mobile-menu" aria-label="展开课程导航" aria-expanded="false">☰</button><div class="breadcrumb" id="breadcrumb">WORKSPACE <span>/</span> 学习总览</div><div class="top-actions"><button class="search-trigger" id="open-search"><span>⌕</span><span>搜索题目、知识点</span><kbd>Ctrl K</kbd></button><button class="timer-trigger" id="open-timer" aria-label="练习计时器"><span class="timer-dot"></span><span id="timer-label">25:00</span></button><button class="icon-button" id="theme-toggle" aria-label="切换深色模式">◐</button></div></header>
+  <main id="content" tabindex="-1"></main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <dialog id="search-dialog" class="search-dialog"><form method="dialog"><button class="dialog-close" aria-label="关闭搜索">×</button></form><label for="search-input" class="visually-hidden">搜索题目</label><div class="search-field"><span>⌕</span><input id="search-input" placeholder="搜索 Softmax、归约、T.gemm…" autocomplete="off"><kbd>Esc</kbd></div><div id="search-results"></div><div class="dialog-foot">↑ ↓ 选择 · Enter 打开 · 搜索包含知识点与代码 API</div></dialog>
+  <dialog id="timer-dialog" class="small-dialog"><form method="dialog"><button class="dialog-close" aria-label="关闭计时器">×</button></form><div class="eyebrow">FOCUS SESSION</div><h2>给自己一场模拟面试</h2><p class="muted">先独立拆解，再查看实现。计时到点后会在本页提示。</p><div class="timer-large" id="timer-large">25:00</div><div class="timer-presets"><button data-duration="15">15 分钟</button><button data-duration="25">25 分钟</button><button data-duration="45">45 分钟</button></div><div class="button-row"><button class="button primary" id="timer-start">开始计时</button><button class="button" id="timer-reset">重置</button></div></dialog>
+  <dialog id="settings-dialog" class="small-dialog"><form method="dialog"><button class="dialog-close" aria-label="关闭进度设置">×</button></form><div class="eyebrow">YOUR LEARNING RECORD</div><h2>带走你的学习进度</h2><p class="muted">状态、检查清单、笔记和练习草稿保存在当前浏览器。导出后可在其他设备导入。</p><div class="settings-actions"><button class="button primary" id="export-progress">导出进度 JSON ↗</button><label class="button file-button">导入进度 JSON<input type="file" id="import-progress" accept="application/json,.json"></label><button class="button danger" id="reset-progress">清空本地进度</button></div><p class="small muted">导入会覆盖当前记录。本站不上传你的学习内容。</p></dialog>
+  <noscript>请启用 JavaScript 以使用题目导航和练习功能。</noscript>
+</body>
+</html>

@@ -1,0 +1,692 @@
+[
+  {
+    "id": "P13",
+    "module": "M5",
+    "title": "Decode Attention",
+    "subtitle": "从一个 query 理解 KV 读取、稳定 softmax 与加权归约",
+    "difficulty": "挑战",
+    "minutes": 50,
+    "tags": [
+      "Attention",
+      "Decode",
+      "Softmax",
+      "归约"
+    ],
+    "statement": "实现一个 batch、一个 attention head、一个 query 的 decode attention。Q 是 D 维向量，连续存储的 K、V 各包含 S 个历史 token。输出为 softmax(QKᵀ/√D)V。基础实现用一个 block 完成全部计算，不把分数矩阵写回全局内存。它用于解释语义和数据流；长上下文、分页 KV、GQA 和 split-KV 需进一步设计。",
+    "formula": "score[s] = Σd Q[d]·K[s,d]/√D；p[s] = exp(score[s]−max(score))/Σt exp(score[t]−max(score))；O[d] = Σs p[s]·V[s,d]",
+    "inputs": "Q:[D]、K:[S,D]、V:[S,D]，连续 row-major FP32 CUDA 张量；B=H=1。",
+    "outputs": "O:[D] FP32。",
+    "constraints": [
+      "1≤S≤256，D∈{32,64}；S、D 在编译时固定。",
+      "输入为有限、幅度适中的数值，点积与加权和不发生 FP32 溢出。",
+      "Q 代表当前 token，K/V 已包含所有可见 token，不额外构造 causal mask。",
+      "代码未实现分页地址计算、GQA、split-KV 或长序列在线 softmax。",
+      "当前环境只检查 Python 语法，未完成 TileLang 编译、GPU 正确性或性能实测。"
+    ],
+    "approach": [
+      "按 D 归约每个 Q·K 乘积，得到 S 个分数；padding 分数必须是 −∞。",
+      "先减最大分数再取指数，按 S 归约分母；有效 token 至少一个，分母大于零。",
+      "归一化后的概率乘 V，再按 S 归约输出 D 维向量。",
+      "单 block 版本保留完整 score tile，S 增大会提高寄存器压力。长上下文可按 KV tile 流式更新 running max、分母和未归一化输出。",
+      "split-KV 的每段返回 (m,l,o)：合并时 m=max(mj)，l=Σexp(mj−m)lj，o=Σexp(mj−m)oj，最后 o/l。分页只改变逻辑 token 到物理 KV 页的寻址，合并规则不变。"
+    ],
+    "mapping": [
+      {
+        "cuda": "一个 CTA 处理一条 query",
+        "tilelang": "T.Kernel(1, threads=128)",
+        "why": "基础版本将跨 token 的同步限制在一个 block 内。"
+      },
+      {
+        "cuda": "手写 dot product、warp/block reduction",
+        "tilelang": "T.Parallel + T.reduce_sum",
+        "why": "分别沿 head dimension 和序列维表达不同的归约。"
+      },
+      {
+        "cuda": "score 的 max/sum 与 exp",
+        "tilelang": "T.reduce_max、T.exp、T.reduce_sum",
+        "why": "稳定 softmax 的顺序保持明确。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 单 query / 单 block",
+        "note": "完整 FP32 教学实现；覆盖非二次幂 S。Python 语法已检查，GPU 编译与运行待验证。",
+        "code": "import math\nimport torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_decode_attention(S, D):\n    # 教学范围：一个 batch、一个 head、一条 query。\n    assert 1 <= S <= 256 and D in (32, 64)\n    BS = 1 << (S - 1).bit_length()\n    inv_sqrt_d = 1.0 / math.sqrt(D)\n\n    @T.prim_func\n    def main(\n        Q: T.Tensor((D,), \"float32\"),\n        K: T.Tensor((S, D), \"float32\"),\n        V: T.Tensor((S, D), \"float32\"),\n        O: T.Tensor((D,), \"float32\"),\n    ):\n        with T.Kernel(1, threads=128):\n            qk = T.alloc_fragment((BS, D), \"float32\")\n            scores = T.alloc_fragment((BS,), \"float32\")\n            m = T.alloc_fragment((1,), \"float32\")\n            denom = T.alloc_fragment((1,), \"float32\")\n            weighted = T.alloc_fragment((BS, D), \"float32\")\n            out = T.alloc_fragment((D,), \"float32\")\n\n            # 每个有效 key 与唯一 query 做点积。\n            for s, d in T.Parallel(BS, D):\n                if s < S:\n                    qk[s, d] = Q[d] * K[s, d]\n                else:\n                    qk[s, d] = 0.0\n            T.reduce_sum(qk, scores, dim=1, clear=True)\n            for s in T.Parallel(BS):\n                if s < S:\n                    scores[s] = scores[s] * inv_sqrt_d\n                else:\n                    scores[s] = -T.infinity(\"float32\")\n\n            # 稳定 softmax；padding 对分母贡献为零。\n            T.reduce_max(scores, m, dim=0, clear=True)\n            for s in T.Parallel(BS):\n                scores[s] = T.exp(scores[s] - m[0])\n            T.reduce_sum(scores, denom, dim=0, clear=True)\n            for s in T.Parallel(BS):\n                scores[s] = scores[s] / denom[0]\n\n            # 对序列维求加权和，得到一个 D 维输出。\n            for s, d in T.Parallel(BS, D):\n                if s < S:\n                    weighted[s, d] = scores[s] * V[s, d]\n                else:\n                    weighted[s, d] = 0.0\n            T.reduce_sum(weighted, out, dim=0, clear=True)\n            T.copy(out, O)\n\n    return tilelang.compile(main, out_idx=None, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    for S, D in [(1, 32), (127, 64), (256, 64)]:\n        q = torch.randn(D, device=\"cuda\")\n        k = torch.randn(S, D, device=\"cuda\")\n        v = torch.randn(S, D, device=\"cuda\")\n        out = torch.empty(D, device=\"cuda\")\n        kernel = make_decode_attention(S, D)\n        kernel(q, k, v, out)\n        # FP64 reference 降低 reference 自身归约误差。\n        score = (k.double() @ q.double()) / math.sqrt(D)\n        ref = (torch.softmax(score, dim=0) @ v.double()).float()\n        torch.testing.assert_close(out, ref, rtol=2e-4, atol=2e-5)\n    print(\"Decode attention checks passed\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "把 padding 分数设为零",
+        "body": "零也会进入 softmax，改变分母和结果。点积 padding 可以填零，但 softmax 前的 padding score 要改成 −∞。"
+      },
+      {
+        "title": "每段 softmax 后直接相加",
+        "body": "不同 KV 段的最大值和分母不同，局部概率不处于同一归一化尺度。split-KV 必须携带 max、sum 和未归一化输出再合并。"
+      },
+      {
+        "title": "把一条 query 的结果当成吞吐结论",
+        "body": "只有一个 CTA 很难让 GPU 充分并行。应区分延迟示例与多 batch、多 head 的真实吞吐，并记录 S、D、数据类型。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么 decode 常常受 KV 读取影响？",
+        "a": "每次只新增少量 query，却要读取已有 token 的 K/V。算术复用随形状和 batching 改变，应结合实际读字节数和算力分析。"
+      },
+      {
+        "q": "这个版本为什么没有 causal mask？",
+        "a": "输入 K/V 被定义为当前 query 可见的完整历史区间；如果含未来 token，需要显式屏蔽。"
+      },
+      {
+        "q": "连续 KV 如何扩展到 paged attention？",
+        "a": "加入 block table，将 token 下标拆成逻辑页号和页内偏移，再查物理页。softmax 和 split 合并公式保持一致。"
+      }
+    ],
+    "checklist": [
+      "验证 S=1、非二次幂 S 与最大教学形状。",
+      "检查 padding 概率为零，所有有效概率之和接近一。",
+      "针对目标 GPU 检查寄存器占用，再决定在线分块或 split-KV。"
+    ],
+    "blanks": [
+      {
+        "prompt": "softmax 前，越界 token 的 score 应填什么？",
+        "answer": "-T.infinity(\"float32\")",
+        "hint": "使其指数贡献为零。"
+      },
+      {
+        "prompt": "两个 KV 分段的统计量合并时，局部分母要乘什么权重？",
+        "answer": "exp(m_j - m)，其中 m=max_j(m_j)",
+        "hint": "先对齐各段的指数尺度。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：Language Basics",
+        "url": "https://www.tilelang.com/programming_guides/language_basics.html"
+      },
+      {
+        "label": "TileLang 官方：Instructions",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方：归约 API 源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      }
+    ]
+  },
+  {
+    "id": "P14",
+    "module": "M6",
+    "title": "GEMM",
+    "subtitle": "FP16 Tensor Core 乘法，FP32 累加和输出",
+    "difficulty": "挑战",
+    "minutes": 55,
+    "tags": [
+      "GEMM",
+      "Tensor Core",
+      "Shared Memory",
+      "Pipeline"
+    ],
+    "statement": "实现 C=A×B。A、B 为连续 row-major FP16，累加和输出为 FP32。先选定规则 tile，把一个输出 tile 的 K 方向循环写清，再用两阶段流水表达数据搬运与计算的重叠。本题不把低精度乘法命名为纯 FP32 SGEMM。",
+    "formula": "C[m,n] = Σk float32(A[m,k])·float32(B[k,n])；A、B 的存储类型为 FP16",
+    "inputs": "A:[M,K] FP16，B:[K,N] FP16；同一 CUDA 设备上的连续 row-major 张量。",
+    "outputs": "C:[M,N] FP32。",
+    "constraints": [
+      "BM=BN=64，BK=32；M、N 是 64 的正整数倍，K 是 32 的正整数倍。",
+      "目标 GPU 和 CUDA 工具链应支持所选 FP16 Tensor Core 路径；具体 MMA 指令以生成源码为准。",
+      "此实现没有尾块处理、转置输入、bias、activation 或 split-K。",
+      "FP16 输入、FP32 累加不等于 FP32 输入的 SGEMM；对比必须统一输入、输出精度与容差。",
+      "Python 语法已检查；当前环境没有 TileLang/PyTorch GPU 运行结果。"
+    ],
+    "approach": [
+      "把输出矩阵划成 64×64 tile，一个 block 负责一个 tile。",
+      "每轮把 64×32 的 A 子块和 32×64 的 B 子块拷贝到共享内存，再用 T.gemm 累加。",
+      "累加器在 K 循环之前清零，K 循环之后只写回一次。",
+      "T.Pipelined(num_stages=2) 表达两阶段流水意图；是否实现有效重叠，要看生成代码与实测。",
+      "调优时比较 tile 大小、BK、线程数和流水级数对数据复用、共享内存和寄存器资源的共同影响。"
+    ],
+    "mapping": [
+      {
+        "cuda": "blockIdx.x/y 定位输出子矩阵",
+        "tilelang": "T.Kernel(N//BN, M//BM)",
+        "why": "输出 tile 与二维 grid 直接对应。"
+      },
+      {
+        "cuda": "共享内存 A/B tile + MMA accumulator",
+        "tilelang": "T.alloc_shared + T.alloc_fragment + T.gemm",
+        "why": "明确数据暂存位置与 FP32 累加类型。"
+      },
+      {
+        "cuda": "双缓冲或异步预取流水",
+        "tilelang": "T.Pipelined(..., num_stages=2)",
+        "why": "由编译器组织流水，仍需验证实际同步和资源开销。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 64×64×32 分块与两阶段流水",
+        "note": "完整 FP16→FP32 GEMM；限制规则整块形状。语法已检查，GPU 编译和性能待验证。",
+        "code": "import torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_gemm(M, N, K):\n    # FP16 输入、FP32 累加和输出；不是纯 FP32 SGEMM。\n    BM, BN, BK = 64, 64, 32\n    assert M > 0 and N > 0 and K > 0\n    assert M % BM == 0 and N % BN == 0 and K % BK == 0\n\n    @T.prim_func\n    def main(\n        A: T.Tensor((M, K), \"float16\"),\n        B: T.Tensor((K, N), \"float16\"),\n        C: T.Tensor((M, N), \"float32\"),\n    ):\n        with T.Kernel(N // BN, M // BM, threads=128) as (bx, by):\n            a_s = T.alloc_shared((BM, BK), \"float16\")\n            b_s = T.alloc_shared((BK, BN), \"float16\")\n            acc = T.alloc_fragment((BM, BN), \"float32\")\n\n            # 整个 K 方向共同累加到同一块 FP32 寄存器。\n            T.clear(acc)\n            for ko in T.Pipelined(K // BK, num_stages=2):\n                T.copy(A[by * BM, ko * BK], a_s)\n                T.copy(B[ko * BK, bx * BN], b_s)\n                # Tensor Core MMA 的具体选择由目标 GPU 和编译器决定。\n                T.gemm(a_s, b_s, acc)\n            T.copy(acc, C[by * BM, bx * BN])\n\n    return tilelang.compile(main, out_idx=None, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    # reference 不通过 TF32 降低乘法精度。\n    torch.backends.cuda.matmul.allow_tf32 = False\n    for M, N, K in [(64, 64, 32), (256, 256, 128)]:\n        a = (torch.randn(M, K, device=\"cuda\") * 0.2).half()\n        b = (torch.randn(K, N, device=\"cuda\") * 0.2).half()\n        c = torch.empty(M, N, device=\"cuda\", dtype=torch.float32)\n        kernel = make_gemm(M, N, K)\n        kernel(a, b, c)\n        # 对相同的、已经量化为 FP16 的输入计算 reference。\n        ref = a.float() @ b.float()\n        torch.testing.assert_close(c, ref, rtol=2e-3, atol=2e-4)\n        print(f\"checked M={M}, N={N}, K={K}\")\n\n    # 在目标 GPU 上可检查生成源码中的 MMA/WGMMA 指令。\n    # print(kernel.get_kernel_source())\n    # 测速前先编译并预热；本脚本不填入预设吞吐量。\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "在 K 循环内清空累加器",
+        "body": "这样最终只保留最后一个 K tile 的乘积。累加器只在整个 K 循环之前清零。"
+      },
+      {
+        "title": "拿不同精度的结果算加速比",
+        "body": "FP16 Tensor Core 与 FP32 CUDA core、TF32 的精度和计算路径不同。报告应写明 A/B、累加器和输出类型。"
+      },
+      {
+        "title": "流水越深越快",
+        "body": "更多 stage 需要更多共享内存，可能降低 occupancy。对这个 tile 的最优 stage 必须结合 GPU 与 K 实测。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么把 A/B 放在共享内存？",
+        "a": "同一个 tile 的数据会被多个输出元素复用，同时为 Tensor Core 操作提供合适的操作数存储。"
+      },
+      {
+        "q": "C 是 FP32 就意味着乘法也是 FP32 吗？",
+        "a": "不是。本题输入已量化为 FP16，乘法路径使用这些 FP16 值，再用 FP32 累加。"
+      },
+      {
+        "q": "什么时候考虑 split-K？",
+        "a": "当 M/N 产生的输出 tile 太少、K 很长时，可以拆分 K 提高并行度；代价是额外部分和、归约与数值顺序变化。"
+      }
+    ],
+    "checklist": [
+      "核对 A:[M,K]、B:[K,N] 的维度和 row-major 布局。",
+      "比较同一 FP16 输入对应的 FP32 reference，并说明误差容差。",
+      "在目标 GPU 检查 MMA 指令、共享内存和寄存器，再执行统一口径测速。"
+    ],
+    "blanks": [
+      {
+        "prompt": "本题累加器应分配为什么类型？",
+        "answer": "T.alloc_fragment((BM, BN), \"float32\")",
+        "hint": "输入与累加器不必使用相同精度。"
+      },
+      {
+        "prompt": "整个 K 方向的累加器应在何时清零？",
+        "answer": "在 K 循环之前清零一次。",
+        "hint": "每轮 T.gemm 都要保留已有部分和。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：GEMM 示例",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/examples/gemm/example_gemm.py"
+      },
+      {
+        "label": "TileLang 官方：Instructions",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方：Language Basics",
+        "url": "https://www.tilelang.com/programming_guides/language_basics.html"
+      }
+    ]
+  },
+  {
+    "id": "P15",
+    "module": "M6",
+    "title": "GEMV",
+    "subtitle": "连续列访问与一行一个 block 的 FP32 点积",
+    "difficulty": "进阶",
+    "minutes": 30,
+    "tags": [
+      "GEMV",
+      "FP32",
+      "归约",
+      "Memory Bound"
+    ],
+    "statement": "实现 FP32 矩阵向量乘 Y=A·X。A 按 row-major 存储，一个 block 处理一行并沿列归约。教学版覆盖非二次幂 N，通过 padding 和边界保护保持点积正确。",
+    "formula": "Y[m] = Σn A[m,n]·X[n]",
+    "inputs": "A:[M,N]、X:[N]，连续 FP32 CUDA 张量。",
+    "outputs": "Y:[M] FP32。",
+    "constraints": [
+      "M>0，1≤N≤4096，M/N 在编译时固定。",
+      "输入为有限数，乘积与归约结果在 FP32 范围内。",
+      "代码为一行一个 block 的基础版，未实现 split-N 或跨行共享 X 的专门调度。",
+      "浮点归约顺序可能不同，验证使用容差而非逐位相同。",
+      "仅完成 Python 语法检查，GPU 编译和运行需要目标环境验证。"
+    ],
+    "approach": [
+      "BN 取不小于 N 的最小二次幂，便于表达规则的归约 tile。",
+      "并行计算 A[row,col]·X[col]；无效列明确写零。",
+      "T.reduce_sum 沿列维归约，每行只写一个结果，无需原子操作。",
+      "先利用连续列的合并访问；X 被多行使用时，缓存或共享内存复用是否有益需要测量。",
+      "当 M 太小而 N 很长时，可拆分列维并使用第二阶段归约增加并行度。"
+    ],
+    "mapping": [
+      {
+        "cuda": "blockIdx.x 选择矩阵行",
+        "tilelang": "T.Kernel(M) as row",
+        "why": "每个 block 拥有独立输出，不存在写冲突。"
+      },
+      {
+        "cuda": "线程跨连续列读取并做局部乘法",
+        "tilelang": "T.Parallel(BN)",
+        "why": "编译器根据 fragment 布局分配列元素。"
+      },
+      {
+        "cuda": "warp shuffle + block reduction",
+        "tilelang": "T.reduce_sum(products, total, dim=0)",
+        "why": "直接表达点积的归约维。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 每行一个 block",
+        "note": "完整 FP32 GEMV；支持 N 的尾部 padding。Python 语法已检查，GPU 编译与测试待验证。",
+        "code": "import torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_gemv(M, N):\n    # 一个 block 负责一行；完整归约列维。\n    assert M > 0 and 1 <= N <= 4096\n    BN = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(\n        A: T.Tensor((M, N), \"float32\"),\n        X: T.Tensor((N,), \"float32\"),\n        Y: T.Tensor((M,), \"float32\"),\n    ):\n        with T.Kernel(M, threads=128) as row:\n            products = T.alloc_fragment((BN,), \"float32\")\n            total = T.alloc_fragment((1,), \"float32\")\n\n            # row-major A 的连续列由并行循环处理。\n            # padding 必须填 sum 的单位元零。\n            for col in T.Parallel(BN):\n                if col < N:\n                    products[col] = A[row, col] * X[col]\n                else:\n                    products[col] = 0.0\n            T.reduce_sum(products, total, dim=0, clear=True)\n            for i in T.Parallel(1):\n                Y[row] = total[i]\n\n    return tilelang.compile(main, out_idx=None, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    for M, N in [(1, 1), (37, 1000), (128, 4096)]:\n        a = torch.randn(M, N, device=\"cuda\")\n        x = torch.randn(N, device=\"cuda\")\n        y = torch.empty(M, device=\"cuda\")\n        kernel = make_gemv(M, N)\n        kernel(a, x, y)\n\n        # 用 FP64 点积检查 FP32 归约，允许合理的加法次序误差。\n        ref = (a.double() @ x.double()).float()\n        torch.testing.assert_close(y, ref, rtol=1e-4, atol=3e-4)\n        assert y.shape == (M,)\n        assert y.dtype == torch.float32\n        print(f\"checked M={M}, N={N}\")\n\n    # 若 M 很小而 N 很长，再设计多 block 的分段归约。\n    # 这份基础版本无需全局原子操作或额外归约 kernel。\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "padding 使用未初始化寄存器",
+        "body": "sum 会把所有 BN 个元素纳入归约。越界列必须写零，不能只跳过赋值。"
+      },
+      {
+        "title": "先做转置让线程跨行访问",
+        "body": "题目 A 是 row-major，同一行连续列更容易形成合并读取。改变映射前要明确真实 stride。"
+      },
+      {
+        "title": "把 GEMM 的复用直觉直接套过来",
+        "body": "一条 X 与每行只产生一个标量，不具备大 GEMM 输出 tile 的二维复用。是否需要共享内存应按流量和复用次数判断。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "GEMV 为什么通常比 GEMM 更容易受带宽影响？",
+        "a": "每个矩阵元素只贡献一次乘加，A 的复用很少。忽略 X/Y 的小量流量时，每读取四字节 A 大约做两次浮点运算。"
+      },
+      {
+        "q": "N 很大时为什么不无限增大 BN？",
+        "a": "fragment 更大，寄存器和编译成本增加；若有溢出到 local memory，实际流量也会增加。"
+      },
+      {
+        "q": "M=1 时如何利用更多 SM？",
+        "a": "把 N 拆成多个 block 的部分点积，再用第二个 kernel 合并；需要权衡额外启动与部分和流量。"
+      }
+    ],
+    "checklist": [
+      "用 N=1、非二次幂 N 和最大教学 N 检查边界。",
+      "验证 X/Y 的形状、dtype、设备与连续性。",
+      "将编译与分配移出计时，分别观察小 M 和大 M 的行为。"
+    ],
+    "blanks": [
+      {
+        "prompt": "点积的无效列应使用什么 padding 值？",
+        "answer": "0.0",
+        "hint": "求和的单位元。"
+      },
+      {
+        "prompt": "一个 block 处理一行时，grid 应有多少个 block？",
+        "answer": "M",
+        "hint": "每个 block 写出一个 Y[row]。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：归约 API 源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方：Language Basics",
+        "url": "https://www.tilelang.com/programming_guides/language_basics.html"
+      },
+      {
+        "label": "TileLang 官方：Instructions",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      }
+    ]
+  },
+  {
+    "id": "P16",
+    "module": "M7",
+    "title": "TopK",
+    "subtitle": "小 K 迭代 argmax，明确相等值的下标规则",
+    "difficulty": "进阶",
+    "minutes": 40,
+    "tags": [
+      "TopK",
+      "Argmax",
+      "Tie Breaking",
+      "归约"
+    ],
+    "statement": "对每一行返回最大的 K 个值及其原始列下标，按值降序排列；值相等时，原始列下标较小的元素优先。基础实现用 K 次 argmax，不进行完整排序，适合解释小 K 选择与重复值处理。",
+    "formula": "第 r 轮：v=max(work)；i=min{j | work[j]=v}；输出(v,i)，只把 work[i] 置为 −∞",
+    "inputs": "X:[M,N] FP32；所有输入必须是有限数。",
+    "outputs": "Values:[M,K] FP32，Indices:[M,K] int32；降序，ties 取小下标。",
+    "constraints": [
+      "M>0，1≤N≤2048，1≤K≤min(8,N)。",
+      "不支持 NaN、+∞、−∞；−∞ 是内部删除及 padding 的哨兵。",
+      "索引为原始列下标，相等值按下标升序稳定选择。",
+      "该方法进行约 O(K·N) 工作，K 变大后应考虑其他选择策略。",
+      "Python 语法已检查；当前环境未做 GPU 编译或运行。"
+    ],
+    "approach": [
+      "将每行有效值载入 fragment，padding 写 −∞。",
+      "每轮先归约最大值，再为等于最大值的位置构造原始下标；其他位置填 BN。",
+      "对候选下标求最小值，完成确定性的 first-index tie breaking。",
+      "写出值和下标后只删除一个选中的位置，保留其他相等值。",
+      "K 大时迭代归约成本上升，可研究局部选择后合并、分桶或基于排序网络的策略。"
+    ],
+    "mapping": [
+      {
+        "cuda": "max-value block reduction",
+        "tilelang": "T.reduce_max(work, best)",
+        "why": "一次归约确定当前剩余最大值。"
+      },
+      {
+        "cuda": "argmax 的 tie breaking",
+        "tilelang": "候选下标 fragment + T.reduce_min",
+        "why": "避免依赖未规定的线程归约顺序。"
+      },
+      {
+        "cuda": "屏蔽已经选中的元素",
+        "tilelang": "仅令 work[first] = −∞",
+        "why": "保留其他位置上的重复值。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · K 次确定性 argmax",
+        "note": "完整值/下标输出，含重复值与非二次幂 N 测试。语法已检查，GPU 运行待验证。",
+        "code": "import torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_topk(M, N, K):\n    # 有限 FP32 输入，小 K；相同值优先选择原始下标较小者。\n    assert M > 0 and 1 <= N <= 2048\n    assert 1 <= K <= min(8, N)\n    BN = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Values: T.Tensor((M, K), \"float32\"),\n        Indices: T.Tensor((M, K), \"int32\"),\n    ):\n        with T.Kernel(M, threads=128) as row:\n            work = T.alloc_fragment((BN,), \"float32\")\n            candidates = T.alloc_fragment((BN,), \"int32\")\n            best = T.alloc_fragment((1,), \"float32\")\n            first = T.alloc_fragment((1,), \"int32\")\n\n            for col in T.Parallel(BN):\n                if col < N:\n                    work[col] = X[row, col]\n                else:\n                    work[col] = -T.infinity(\"float32\")\n\n            for rank in T.serial(K):\n                T.reduce_max(work, best, dim=0, clear=True)\n                # 先归约值，再在等于最大值的位置中选最小下标。\n                for col in T.Parallel(BN):\n                    candidates[col] = T.if_then_else(\n                        work[col] == best[0], col, BN\n                    )\n                T.reduce_min(candidates, first, dim=0, clear=True)\n                for i in T.Parallel(1):\n                    Values[row, rank] = best[i]\n                    Indices[row, rank] = first[i]\n                # 只删除被选中的位置，重复值可在下一轮继续入选。\n                for col in T.Parallel(BN):\n                    if col == first[0]:\n                        work[col] = -T.infinity(\"float32\")\n\n    return tilelang.compile(main, out_idx=None, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    M, N, K = 17, 513, 8\n    # 有意生成大量 ties，并增加整行相等的样例。\n    x = torch.randint(-8, 9, (M, N), device=\"cuda\").float()\n    x[0].fill_(3.0)\n    values = torch.empty(M, K, device=\"cuda\")\n    indices = torch.empty(M, K, device=\"cuda\", dtype=torch.int32)\n    make_topk(M, N, K)(x, values, indices)\n\n    ref_idx = torch.argsort(x, dim=1, descending=True, stable=True)[:, :K]\n    ref_values = torch.gather(x, 1, ref_idx)\n    torch.testing.assert_close(values, ref_values, rtol=0, atol=0)\n    torch.testing.assert_close(indices, ref_idx.int(), rtol=0, atol=0)\n    print(\"TopK values, indices and tie rule checked\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "删除所有等于最大值的位置",
+        "body": "TopK 选择的是元素而非不同数值。删除所有重复最大值会漏掉应该入选的元素。"
+      },
+      {
+        "title": "用不稳定 reference 比较下标",
+        "body": "torch.topk 对相等值下标的选择不适合作为本题规则的依据。这里使用 stable=True 的降序 argsort 构造 reference。"
+      },
+      {
+        "title": "允许输入 −∞ 却沿用相同哨兵",
+        "body": "真实 −∞、被删除元素和 padding 无法区分。扩展输入域时需要单独的有效标记，或按 value/index pair 做严格选择。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么不只求 max 的归约位置？",
+        "a": "还需明确相等值规则。两次归约把值比较和下标比较拆开，语义直接，代价也清楚。"
+      },
+      {
+        "q": "K=8 时是否一定比排序快？",
+        "a": "不能直接断言。迭代两次归约的同步代价、N、数据分布和 GPU 都会影响结果，应与同语义排序方案测量。"
+      },
+      {
+        "q": "如何支持 Inf 或 NaN？",
+        "a": "先定义排序规则，再加入独立有效掩码和相应比较器，避免把合法输入与内部哨兵混淆。"
+      }
+    ],
+    "checklist": [
+      "测试整行相等、重复最大值、负值与 N 非二次幂。",
+      "同时核对值、原始下标和 tie breaking。",
+      "验证 K≤N，并确认每个有效位置最多被选一次。"
+    ],
+    "blanks": [
+      {
+        "prompt": "与最大值相等的候选中，应对原始下标执行什么归约？",
+        "answer": "T.reduce_min",
+        "hint": "本题相等值优先小下标。"
+      },
+      {
+        "prompt": "选中一个最大值后，应删除哪些位置？",
+        "answer": "只删除本轮选中的一个原始位置。",
+        "hint": "其他重复最大值仍可在下一轮入选。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：归约 API 源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方：Instructions",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方：Language Basics",
+        "url": "https://www.tilelang.com/programming_guides/language_basics.html"
+      }
+    ]
+  },
+  {
+    "id": "P17",
+    "module": "M7",
+    "title": "Sort",
+    "subtitle": "用双共享缓冲写清 bitonic 比较交换",
+    "difficulty": "挑战",
+    "minutes": 50,
+    "tags": [
+      "Sort",
+      "Bitonic",
+      "Shared Memory",
+      "同步"
+    ],
+    "statement": "对每行 FP32 数值做升序排序。N 为二次幂，一行由一个 block 完成。采用 bitonic sorting network，每轮从共享缓冲 a 读取全部旧值，写入缓冲 b；同步后再把 b 复制回 a。代码优先让数据依赖和同步可审查。",
+    "formula": "width=2^level；stride=2^(level−1−phase)；partner=i xor stride；依方向位保留 min 或 max",
+    "inputs": "X:[M,N] FP32，连续 row-major CUDA 张量，元素有限。",
+    "outputs": "Y:[M,N] FP32，逐行升序值；不返回索引，不承诺稳定排序。",
+    "constraints": [
+      "M>0，N 是 2 的幂，1≤N≤1024。",
+      "只定义有限 FP32 数值的值排序，不支持 NaN 排序规则。",
+      "每个 block 使用两个 N 元素 FP32 共享缓冲，约 8N 字节。",
+      "非二次幂 N 需另加 padding 与裁剪；本实现不隐式接受该输入。",
+      "已做 Python 语法检查，尚未进行 GPU 编译、race 检测或性能实测。"
+    ],
+    "approach": [
+      "将一行读入 a；level 逐步扩大 bitonic 合并段宽度。",
+      "每个 phase 根据 stride 找配对元素。用整除和奇偶判断表达 partner 与方向位，等价于 XOR 网络。",
+      "所有输出位置都读同一个旧 a 快照，各自只写 b[i]，避免原地跨线程读写冲突。",
+      "在 b 完成后同步，复制 b 到 a，再同步后开始下一轮比较。",
+      "O(N·log²N) 的比较和多次同步适合作为中小行教学基线；更快版本可研究 warp shuffle、分段网络和减少共享拷贝。"
+    ],
+    "mapping": [
+      {
+        "cuda": "共享内存中的 compare-exchange",
+        "tilelang": "T.alloc_shared + T.Parallel",
+        "why": "同一个旧 tile 上的配对读取与唯一写入保持明确。"
+      },
+      {
+        "cuda": "i xor stride",
+        "tilelang": "按 stride 分组的奇偶分支，选择 i+stride 或 i−stride",
+        "why": "表达同一配对关系，且无需原地交换。"
+      },
+      {
+        "cuda": "每轮比较后的 __syncthreads()",
+        "tilelang": "T.sync_threads()",
+        "why": "所有线程必须完成本轮数据生产才能进入下一轮。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · bitonic 双缓冲基础版",
+        "note": "完整逐行值排序；显式同步、防止同轮原地覆盖。语法已检查，GPU 编译和并发检查待验证。",
+        "code": "import torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_row_sort(M, N):\n    # 仅升序值排序；N 为 2 的幂，输入不含 NaN/Inf。\n    assert M > 0 and 1 <= N <= 1024 and (N & (N - 1)) == 0\n    LOG_N = N.bit_length() - 1\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Y: T.Tensor((M, N), \"float32\"),\n    ):\n        with T.Kernel(M, threads=128) as row:\n            a = T.alloc_shared((N,), \"float32\")\n            b = T.alloc_shared((N,), \"float32\")\n            T.copy(X[row, 0], a)\n            T.sync_threads()\n\n            for level in T.serial(1, LOG_N + 1):\n                width = (T.int32(1) << level)\n                for phase in T.serial(level):\n                    stride = (T.int32(1) << (level - 1 - phase))\n                    # 这一轮 a 是只读快照，b 是每个位置唯一的写入目标。\n                    for i in T.Parallel(N):\n                        partner = T.if_then_else(\n                            (i // stride) % 2 == 0,\n                            i + stride,\n                            i - stride,\n                        )\n                        # 等价于 bitonic 的方向位和 pair 内高低位比较。\n                        keep_min = (i // width) % 2 == (i // stride) % 2\n                        if keep_min:\n                            b[i] = T.min(a[i], a[partner])\n                        else:\n                            b[i] = T.max(a[i], a[partner])\n\n                    # 全部 b 完成之后才覆盖 a。\n                    T.sync_threads()\n                    for i in T.Parallel(N):\n                        a[i] = b[i]\n                    # 全部 a 完成之后才进入下一轮比较。\n                    T.sync_threads()\n\n            T.copy(a, Y[row, 0])\n\n    return tilelang.compile(main, out_idx=None, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    for M, N in [(3, 1), (7, 32), (17, 512)]:\n        # 重复值和负数同样参与排序；不承诺元素稳定性。\n        x = torch.randint(-20, 21, (M, N), device=\"cuda\").float()\n        y = torch.empty_like(x)\n        make_row_sort(M, N)(x, y)\n        ref = torch.sort(x, dim=1).values\n        torch.testing.assert_close(y, ref, rtol=0, atol=0)\n        if N > 1:\n            assert bool(torch.all(y[:, 1:] >= y[:, :-1]))\n        print(f\"checked M={M}, N={N}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "每个线程直接更新 a[i]",
+        "body": "线程读 partner 时，对方可能已写入新值，导致读取混合了前后两轮状态。双缓冲让每轮的源保持只读。"
+      },
+      {
+        "title": "把 barrier 放在条件分支里",
+        "body": "T.sync_threads 是 block 级同步。不同线程条件不一致时不能让部分线程跳过 barrier。这里所有同步均处于统一循环路径。"
+      },
+      {
+        "title": "只检查结果单调",
+        "body": "单调并不保证元素完整，错误 kernel 可能复制最小值并丢失其他值。必须与完整 reference 比较，检查值的多重集合。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么网络要求二次幂 N？",
+        "a": "每一级配对都按二进制位组织。非二次幂可补到下一二次幂，升序通常用 +∞ padding，最后裁剪。"
+      },
+      {
+        "q": "双缓冲是否就是最快实现？",
+        "a": "它提供清晰的数据依赖，但每轮多了一次共享内存复制。性能版可设计缓冲交替或 warp 级网络，仍必须保持正确同步。"
+      },
+      {
+        "q": "如何改成按值排序并输出原始索引？",
+        "a": "给每个元素携带 index，在比较时同时交换 value/index；如需稳定性，比较器还要把 index 作为 tie breaker。"
+      }
+    ],
+    "checklist": [
+      "测试 N=1、含重复值、负数、已经有序与逆序行。",
+      "逐阶段确认源缓冲不会被当前阶段覆盖。",
+      "将输出与完整 torch.sort 结果比较，再检查单调性。"
+    ],
+    "blanks": [
+      {
+        "prompt": "当前阶段写 b 时，a 应保持什么访问模式？",
+        "answer": "只读",
+        "hint": "所有线程要读取同一阶段的旧快照。"
+      },
+      {
+        "prompt": "b 复制回 a 后，下一轮读取 a 前需要什么？",
+        "answer": "T.sync_threads()",
+        "hint": "确保所有线程完成覆盖写入。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：Instructions",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/docs/programming_guides/instructions.md"
+      },
+      {
+        "label": "TileLang 官方：Language Basics",
+        "url": "https://www.tilelang.com/programming_guides/language_basics.html"
+      },
+      {
+        "label": "TileLang 官方：公共语言接口",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/common.py"
+      }
+    ]
+  },
+  {
+    "id": "P18",
+    "module": "M8",
+    "title": "Per-row INT8 Quantization",
+    "subtitle": "逐行 absmax、对称量化与 ties-to-even",
+    "difficulty": "进阶",
+    "minutes": 40,
+    "tags": [
+      "INT8",
+      "Quantization",
+      "归约",
+      "Rounding"
+    ],
+    "statement": "实现逐行对称 INT8 量化。每行 scale 由最大绝对值决定；量化范围使用 [-127,127]，zero point 为零。全零行规定 scale=1、量化值全零。舍入使用最近偶数规则，避免把 float→int 的截断误认为 rounding。",
+    "formula": "a=maxn |X[m,n]|；s=1 if a=0 else a/127；Q=clip(round_to_even(X/s),−127,127)；反量化近似 X̂=Q·s",
+    "inputs": "X:[M,N] FP32，同一 CUDA 设备上的连续 row-major 张量。",
+    "outputs": "Q:[M,N] int8，Scale:[M] FP32；zero point 固定为 0。",
+    "constraints": [
+      "M>0，1≤N≤4096。",
+      "输入为有限数；非零行的 absmax 限于 [1e−30,1e30]，避免极端 scale 下溢或溢出问题。",
+      "采用对称范围 [-127,127]，保留 -128 不使用；量化约定需与下游算子一致。",
+      "ties-to-even 作用于实际 FP32 归一化值；边界附近还受除法精度影响。",
+      "Python 语法已检查；未进行 GPU 编译、正确性和性能验证。"
+    ],
+    "approach": [
+      "并行取绝对值，padding 填零，用 reduce_max 得到每行 absmax。",
+      "全零行 scale=1，其余为 absmax/127；一个 block 只写一个 scale。",
+      "先求归一化值的 floor 和小数部分：小于 0.5 取 floor，大于 0.5 取 floor+1，等于 0.5 时选择偶数。",
+      "先将整数结果裁剪到 [-127,127]，再转换为 int8，避免溢出回绕。",
+      "测试除了随机行，还要显式构造零行与 scale=1 的正负 half-way case；后续可比较量化和反量化误差。"
+    ],
+    "mapping": [
+      {
+        "cuda": "逐行 absmax reduction",
+        "tilelang": "T.Parallel + T.reduce_max",
+        "why": "整行共用同一个动态 scale。"
+      },
+      {
+        "cuda": "round-to-nearest-even 转整数",
+        "tilelang": "T.floor + 小数比较 + 偶数判断",
+        "why": "明确舍入规则，避免依赖某个未说明的 round/cast 约定。"
+      },
+      {
+        "cuda": "saturate 后写 int8",
+        "tilelang": "T.min/T.max 裁剪后 T.cast(...,\"int8\")",
+        "why": "先限定整数范围再做窄类型转换。"
+      }
+    ],
+    "versions": [
+      {
+        "name": "v0 · 逐行对称 INT8",
+        "note": "完整 scale 与量化输出，含零行和正负中点测试。Python 语法已检查，GPU 编译和运行待验证。",
+        "code": "import torch\nimport tilelang\nimport tilelang.language as T\n\n\ndef make_row_int8_quant(M, N):\n    assert M > 0 and 1 <= N <= 4096\n    BN = 1 << (N - 1).bit_length()\n\n    @T.prim_func\n    def main(\n        X: T.Tensor((M, N), \"float32\"),\n        Q: T.Tensor((M, N), \"int8\"),\n        Scale: T.Tensor((M,), \"float32\"),\n    ):\n        with T.Kernel(M, threads=128) as row:\n            abs_x = T.alloc_fragment((BN,), \"float32\")\n            amax = T.alloc_fragment((1,), \"float32\")\n            scale = T.alloc_fragment((1,), \"float32\")\n            for col in T.Parallel(BN):\n                if col < N:\n                    abs_x[col] = T.abs(X[row, col])\n                else:\n                    abs_x[col] = 0.0\n            T.reduce_max(abs_x, amax, dim=0, clear=True)\n            for i in T.Parallel(1):\n                scale[i] = T.if_then_else(\n                    amax[i] == 0.0, 1.0, amax[i] / 127.0\n                )\n                Scale[row] = scale[i]\n\n            for col in T.Parallel(BN):\n                if col < N:\n                    z = X[row, col] / scale[0]\n                    floor_z = T.floor(z)\n                    lo = T.cast(floor_z, \"int32\")\n                    fraction = z - floor_z\n                    # 最近整数；恰好位于中点时选择偶数。\n                    rounded = T.if_then_else(\n                        fraction < 0.5, lo,\n                        T.if_then_else(\n                            fraction > 0.5, lo + 1,\n                            T.if_then_else(lo % 2 == 0, lo, lo + 1),\n                        ),\n                    )\n                    clipped = T.max(-127, T.min(127, rounded))\n                    Q[row, col] = T.cast(clipped, \"int8\")\n\n    return tilelang.compile(main, out_idx=None, target=\"cuda\")\n\n\ndef main():\n    torch.manual_seed(0)\n    M, N = 17, 513\n    x = torch.randn(M, N, device=\"cuda\") * 8.0\n    x[0].zero_()\n    # amax=127 => scale=1；同时检查正负中点的偶数舍入。\n    x[1].zero_()\n    x[1, :8] = torch.tensor(\n        [127.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, -127.0],\n        device=\"cuda\",\n    )\n    q = torch.empty(M, N, device=\"cuda\", dtype=torch.int8)\n    scale = torch.empty(M, device=\"cuda\")\n    make_row_int8_quant(M, N)(x, q, scale)\n\n    amax = x.abs().amax(dim=1)\n    ref_scale = torch.where(amax == 0, torch.ones_like(amax), amax / 127.0)\n    ref_q = torch.round(x / ref_scale[:, None]).clamp(-127, 127).to(torch.int8)\n    torch.testing.assert_close(scale, ref_scale, rtol=1e-6, atol=0)\n    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)\n    assert float(scale[0]) == 1.0\n    print(\"INT8 codes, zero row and ties-to-even checked\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+      }
+    ],
+    "pitfalls": [
+      {
+        "title": "把 int8 cast 当成四舍五入",
+        "body": "浮点转整数通常是截断语义，和最近偶数不同。例如 1.5 要变为 2，2.5 也变为 2。"
+      },
+      {
+        "title": "零行直接使用 absmax/127",
+        "body": "得到 scale=0，归一化时产生 0/0。题目规定零行 scale=1。"
+      },
+      {
+        "title": "舍入后直接转换 int8",
+        "body": "不经裁剪的窄类型转换可能回绕或产生平台相关结果。先将整数限定到量化范围。"
+      }
+    ],
+    "questions": [
+      {
+        "q": "为什么不用 -128？",
+        "a": "本题使用零点为零的严格对称范围 [-127,127]。其他框架可能采用不同范围，集成时必须统一约定。"
+      },
+      {
+        "q": "负数的 ties-to-even 如何处理？",
+        "a": "先 floor，例如 -1.5 的 floor 是 -2；它已经是偶数，因此选 -2。-2.5 的 floor 是 -3，选择相邻偶数 -2。"
+      },
+      {
+        "q": "逐行量化比整个 tensor 一个 scale 多付出什么？",
+        "a": "需要更多 scale、逐行归约和读取 scale 的开销，通常能更贴合不同行的数值范围。最终收益取决于数据分布和下游计算。"
+      }
+    ],
+    "checklist": [
+      "检查全零行 scale=1 且所有 code 为零。",
+      "用 amax=127 的行测试 ±0.5、±1.5、±2.5。",
+      "验证范围、dtype、scale 广播方向及反量化误差。"
+    ],
+    "blanks": [
+      {
+        "prompt": "全零行的 scale 按本题规定应是多少？",
+        "answer": "1.0",
+        "hint": "让零输入归一化后仍为零。"
+      },
+      {
+        "prompt": "ties-to-even 下，-2.5 舍入得到多少？",
+        "answer": "-2",
+        "hint": "两个相邻整数中选择偶数。"
+      }
+    ],
+    "references": [
+      {
+        "label": "TileLang 官方：归约 API 源码",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/reduce_op.py"
+      },
+      {
+        "label": "TileLang 官方：公共语言接口",
+        "url": "https://github.com/tile-ai/tilelang/blob/main/tilelang/language/common.py"
+      },
+      {
+        "label": "TileLang 官方：Language Basics",
+        "url": "https://www.tilelang.com/programming_guides/language_basics.html"
+      }
+    ]
+  }
+]
